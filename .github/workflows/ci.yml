@@ -46,9 +46,10 @@ jobs:
 
       # The deep node counts are the real correctness gate for move generation.
       # They are too slow for every local `go test` run but cheap enough to run
-      # on every push here.
+      # on every push here. This covers the classical positions, the Chess960
+      # suite across all 960 arrangements, and the mirror-symmetry check.
       - name: Perft
-        run: go test ./internal/chess/ -run TestPerft -perft-full -timeout 30m
+        run: go test ./internal/chess/ -run 'TestPerft|TestChess960' -perft-full -timeout 60m
 
   cross-compile:
     name: Cross-compile for the cluster

@@ -88,52 +88,69 @@ func appendPawn(out *[]Move, from, to Square, promoRank int) {
 
 // pseudoLegalCastling handles castling separately, because the rule that the
 // king may not pass through an attacked square cannot be expressed by making
-// the move and inspecting the result — the intermediate square is not the final
-// one. This walks every square from the king's origin to its destination and
-// requires all of them to be safe, which is a different formulation from the
-// generator's tabulated version.
+// the move and inspecting the result — an intermediate square is not the final
+// one.
+//
+// The destination square is deliberately not checked here. referenceLegalMoves
+// plays every move and rejects any leaving the king attacked, which covers the
+// destination exactly, including the Chess960 case where the castling rook was
+// the only thing shielding it. Leaving that to the generic check keeps this
+// reference independent of the real generator, which handles the same case with
+// an explicit x-ray test.
+//
+// Emptiness is checked by walking both spans square by square rather than
+// intersecting a precomputed mask, so a wrong mask in the real generator cannot
+// be reproduced here.
 func (p *Position) pseudoLegalCastling(us Color, occ Bitboard) []Move {
 	var out []Move
 	them := us.Opposite()
+	ksq := p.KingSquare(us)
 
-	type spec struct {
-		right            CastlingRights
-		kingFrom, kingTo Square
-		rookFrom         Square
-	}
-	specs := []spec{
-		{WhiteKingSide, E1, G1, H1},
-		{WhiteQueenSide, E1, C1, A1},
-		{BlackKingSide, E8, G8, H8},
-		{BlackQueenSide, E8, C8, A8},
-	}
-
-	for _, s := range specs {
-		if MakePiece(us, King) != p.board[s.kingFrom] || !p.castling.Has(s.right) {
+	for i := 0; i < 2; i++ {
+		idx := castlingIndex(us, i == 0)
+		if !p.castling.Has(rightAt(idx)) {
 			continue
 		}
-		// Every square strictly between king and rook must be empty.
-		if BetweenBB[s.kingFrom][s.rookFrom]&occ != 0 {
+		rookFrom := p.castlingRook[idx]
+		if rookFrom >= NoSquare || p.board[rookFrom] != MakePiece(us, Rook) {
 			continue
 		}
-		// Every square the king occupies or crosses must be unattacked,
-		// including the one it starts on (no castling out of check).
+		kingTo, rookTo := castlingKingTo(idx), castlingRookTo(idx)
+
+		// Every square either piece travels over or lands on must be empty,
+		// disregarding the two of them. In Chess960 these spans overlap, and
+		// either piece may already stand on its own destination.
+		blocked := false
+		for _, span := range [2][2]Square{{ksq, kingTo}, {rookFrom, rookTo}} {
+			lo, hi := span[0], span[1]
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			for sq := lo; sq <= hi; sq++ {
+				if sq != ksq && sq != rookFrom && p.board[sq] != NoPiece {
+					blocked = true
+				}
+			}
+		}
+		if blocked {
+			continue
+		}
+
+		// The origin and every crossed square must be unattacked; the
+		// destination is left to the make-and-check described above.
 		step := 1
-		if s.kingTo < s.kingFrom {
+		if kingTo < ksq {
 			step = -1
 		}
 		safe := true
-		for sq := s.kingFrom; ; sq = Square(int(sq) + step) {
+		for sq := ksq; sq != kingTo; sq = Square(int(sq) + step) {
 			if p.IsAttacked(sq, them) {
 				safe = false
 				break
 			}
-			if sq == s.kingTo {
-				break
-			}
 		}
 		if safe {
-			out = append(out, NewCastling(s.kingFrom, s.kingTo))
+			out = append(out, NewCastling(ksq, rookFrom))
 		}
 	}
 	return out

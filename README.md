@@ -12,7 +12,8 @@ evaluation, UCI and the Lichess client are not yet implemented.
 |---|---|
 | Board representation, bitboards, magics | done |
 | Legal move generation, make/unmake, Zobrist | done, perft-verified |
-| Game termination rules (draws, mate, stalemate) | done |
+| Chess960 | done, verified on all 960 arrangements |
+| Game termination rules (draws, mate, stalemate, dead positions) | done |
 | Pipeline message contracts and bus abstraction | done |
 | Search (alpha-beta, TT, quiescence) | not started |
 | Evaluation (hand-crafted, then NNUE) | not started |
@@ -115,6 +116,11 @@ is reflected vertically and its colors swapped. Any difference is a bug treating
 one color differently from the other. Its value is that it needs no published
 counts, so it applies to positions nobody has tabulated.
 
+**The Chess960 suite** applies both of the above to all 960 starting
+arrangements, eight random plies deep so that castling is genuinely in play.
+Chess960 is where a castling generator is most likely to be wrong, because the
+overlapping king and rook paths cannot occur in classical chess at all.
+
 **Make/unmake reversibility and incremental-vs-recomputed Zobrist agreement**
 are tested separately, since perft would not catch a hash that drifts or an
 unmake that restores an equivalent-but-differently-represented position.
@@ -126,7 +132,7 @@ go test ./... -perft-full          # full depth, ~610M nodes
 
 ## Rules coverage
 
-Classical chess is fully implemented.
+Classical chess and Chess960 are both fully implemented.
 
 **Moves.** All piece movement. Castling on both wings for both colors, with
 rights revoked when the king moves, when a rook moves, and when a rook is
@@ -156,15 +162,35 @@ The second matters for draw claims: FIDE distinguishes positions by the moves
 available in them, so an unusable en passant target must not make an otherwise
 identical position hash differently, or a threefold repetition goes undetected.
 
-**Known limits.** Insufficient material covers the material-based subset of
-FIDE 5.2.2 — bare kings, king and minor piece, and same-colored bishops. Full
-"dead position" detection, which includes completely locked pawn structures, is
-not tractable and no engine attempts it; the difference only ever costs a draw
-claim in positions that are drawn anyway.
+**Dead positions.** FIDE 5.2.2 declares a position drawn when no sequence of
+legal moves can produce checkmate. Both halves are detected. The material half
+covers bare kings, a lone minor piece, and any number of bishops confined to one
+color complex. The structural half proves a locked pawn position dead: only
+kings and pawns remain, every pawn is blocked with no capture available, and
+neither king can ever reach a capture — from which the only moves that will ever
+exist are king moves, and two lone kings cannot mate.
 
-**Chess960 is not supported.** Castling is encoded as the king's origin and
-destination on the standard squares, correct for classical chess and wrong for
-Fischer random. The Lichess bot should decline Chess960 challenges.
+That second proof needs two observations to fire on real positions. A king may
+never stand on a square an enemy pawn attacks, and frozen pawns never stop
+attacking it, so pawn-attacked squares are permanent walls exactly like the
+pawns; this is what seals the kings apart in the classic interlocked wall. And a
+pawn defended by another pawn can never be taken by a king, since the capture
+would be a move into check. Where the analysis remains approximate it errs
+toward saying no, which can only leave a genuine draw unclaimed — the opposite
+error would adjudicate a winnable game as drawn.
+
+**Chess960 is supported.** Castling is encoded internally as king-takes-rook,
+the only unambiguous form once the king's destination can already be occupied by
+the castling rook, or the king need not move at all. Rook origins and the
+squares that must be empty are stored per position rather than assumed. FEN
+reads and writes both the classical `KQkq` and Shredder `AHah` castling fields,
+and UCI moves are rendered in whichever form the variant expects.
+
+Verification uses the full 960-arrangement perft suite from Ethereal, checked to
+depth 5 across every arrangement — 635 million leaf nodes, all exact — with a
+sampled depth-6 pass under `-perft-full`. The orthodox arrangement written in
+Shredder notation is separately required to reproduce the classical perft counts
+exactly, which pins the generalized code to ground truth everyone agrees on.
 
 ## Building
 

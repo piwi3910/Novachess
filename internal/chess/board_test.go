@@ -222,7 +222,7 @@ func TestLegalMovesInTrickyPositions(t *testing.T) {
 			moves := p.LegalMoves()
 			got := make(map[string]bool, len(moves))
 			for _, m := range moves {
-				got[m.String()] = true
+				got[p.MoveToUCI(m)] = true
 			}
 
 			if tc.wantCount != nil && len(moves) != *tc.wantCount {
@@ -291,8 +291,10 @@ func TestMoveEncoding(t *testing.T) {
 		{NewPromotion(B2, A1, Rook), "b2a1r", KindPromotion},
 		{NewPromotion(B2, A1, Bishop), "b2a1b", KindPromotion},
 		{NewEnPassant(E5, D6), "e5d6", KindEnPassant},
-		{NewCastling(E1, G1), "e1g1", KindCastling},
-		{NewCastling(E8, C8), "e8c8", KindCastling},
+		// Castling is encoded king-takes-rook, so String reports the rook
+		// square; MoveToUCI converts to "e1g1" in classical mode.
+		{NewCastling(E1, H1), "e1h1", KindCastling},
+		{NewCastling(E8, A8), "e8a8", KindCastling},
 	}
 
 	for _, tc := range cases {

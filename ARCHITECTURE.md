@@ -129,6 +129,19 @@ probability ratio test — without that gate, training noise accumulates and the
 engine can get quietly worse across generations while every individual step
 looks fine.
 
+## Variants
+
+Classical chess and Chess960 share one move generator. Castling is encoded
+internally as king-takes-rook, and the rook origins and required-empty squares
+are stored per position rather than assumed, so nothing in the generator
+branches on the variant. Only two things do: how a castling move is written in
+UCI, and how the castling field is written in FEN.
+
+That matters for the pipeline because self-play, training and gating all run on
+classical positions. Chess960 support costs the pipeline nothing — no separate
+code path to keep verified, no second network — while letting the Lichess bot
+accept variant challenges rather than decline them.
+
 ## Determinism
 
 Every node in the cluster must produce identical results for identical inputs.

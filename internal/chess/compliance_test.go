@@ -23,7 +23,13 @@ func TestCastlingRightsWithoutRookAreDropped(t *testing.T) {
 		{"no rooks at all", "4k3/8/8/8/8/8/8/4K3 w KQ - 0 1", NoCastling},
 		{"kingside rook missing", "4k3/8/8/8/8/8/8/R3K3 w KQ - 0 1", WhiteQueenSide},
 		{"queenside rook missing", "4k3/8/8/8/8/8/8/4K2R w KQ - 0 1", WhiteKingSide},
-		{"king off its home square", "4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1", NoCastling},
+		// A king on d1 between two rooks is a legal Chess960 arrangement, and
+		// X-FEN reads KQ as naming the outermost rook on each side, so these
+		// rights are genuine rather than stale. Classical chess would never
+		// produce this FEN, since moving the king revokes both rights.
+		{"king off the classical square but between its rooks", "4k3/8/8/8/8/8/8/R2K3R w KQ - 0 1", WhiteKingSide | WhiteQueenSide},
+		// A king off its back rank entirely cannot castle under any reading.
+		{"king off the back rank", "4k3/8/8/8/8/8/4K3/R6R w KQ - 0 1", NoCastling},
 		{"black rights with no black rooks", "4k3/8/8/8/8/8/8/R3K2R w KQkq - 0 1", WhiteKingSide | WhiteQueenSide},
 		{"a piece that is not a rook on the corner", "4k3/8/8/8/8/8/8/N3K2R w KQ - 0 1", WhiteKingSide},
 		{"all rights genuinely available", "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", AllCastling},
@@ -237,7 +243,7 @@ func TestCastlingRulesInDetail(t *testing.T) {
 			moves := p.LegalMoves()
 			got := make(map[string]bool, len(moves))
 			for _, m := range moves {
-				got[m.String()] = true
+				got[p.MoveToUCI(m)] = true
 			}
 			for _, want := range tc.present {
 				if !got[want] {
@@ -284,7 +290,7 @@ func TestCastlingRightsRevocation(t *testing.T) {
 		{
 			name: "castling itself revokes both rights",
 			fen:  "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
-			move: NewCastling(E1, G1),
+			move: NewCastling(E1, H1),
 			want: BlackKingSide | BlackQueenSide,
 		},
 		{
