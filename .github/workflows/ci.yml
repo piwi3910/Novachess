@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  perft:
+    name: Full-depth perft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      # The deep node counts are the real correctness gate for move generation.
+      # They are too slow for every local `go test` run but cheap enough to run
+      # on every push here.
+      - name: Perft
+        run: go test ./internal/chess/ -run TestPerft -perft-full -timeout 30m
+
+  cross-compile:
+    name: Cross-compile for the cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      # The self-play workers run on arm64. Building for it here catches any
+      # accidental amd64-only dependency at the point it is introduced rather
+      # than at deploy time.
+      - name: Build arm64
+        run: GOOS=linux GOARCH=arm64 go build ./...

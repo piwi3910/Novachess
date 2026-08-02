@@ -1,0 +1,23 @@
+# Binaries
+/novachess
+/novabot
+/novatrain
+/bin/
+*.exe
+
+# Test and profiling artifacts
+*.test
+*.out
+*.prof
+
+# Self-play data and networks: these are large and regenerable, and belong in
+# object storage rather than git.
+/data/
+*.nnue
+*.binpack
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
