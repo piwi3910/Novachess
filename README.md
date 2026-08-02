@@ -12,11 +12,15 @@ evaluation, UCI and the Lichess client are not yet implemented.
 |---|---|
 | Board representation, bitboards, magics | done |
 | Legal move generation, make/unmake, Zobrist | done, perft-verified |
+| Pipeline message contracts and bus abstraction | done |
 | Search (alpha-beta, TT, quiescence) | not started |
 | Evaluation (hand-crafted, then NNUE) | not started |
 | UCI protocol | not started |
 | Lichess bot client | not started |
-| Self-play training pipeline | not started |
+| Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the service topology and the
+reasoning behind where the boundary between engine and services falls.
 
 ## Design
 
@@ -42,18 +46,33 @@ for the cluster from any machine. The cost is SIMD: Go's `simd/archsimd` is
 amd64-only and experiment-gated, so NNUE inference will sit behind an interface
 with a portable scalar implementation and an optional accelerated one.
 
+**Architecture.** The pipeline around the engine is a set of services
+coordinating over NATS: a coordinator issuing work, self-play workers generating
+games, a trainer, and a gatekeeper that SPRT-tests each candidate network before
+promoting it. The engine itself stays a single linked binary — its search
+evaluates millions of positions per second, so a network boundary anywhere
+inside that loop would cost a factor of a thousand. Services are processes
+around the engine, not pieces of it.
+
 ## Layout
 
 ```
-cmd/novachess/     UCI engine binary
-cmd/novabot/       Lichess bot client
-cmd/novatrain/     self-play data generation and training
-internal/chess/    board, move generation, Zobrist, perft
-internal/search/   negamax, transposition table, time management
-internal/eval/     evaluation
-internal/uci/      UCI protocol
-internal/lichess/  Lichess Bot API client
-internal/train/    self-play, data format, optimizer
+cmd/novachess/          UCI engine binary
+cmd/novabot/            Lichess bot client
+cmd/coordinator/        work distribution and dataset assembly
+cmd/selfplay-worker/    game generation
+cmd/trainer/            network training
+cmd/gatekeeper/         SPRT gating
+
+internal/chess/         board, move generation, Zobrist, perft
+internal/search/        negamax, transposition table, time management
+internal/eval/          evaluation
+internal/uci/           UCI protocol
+internal/lichess/       Lichess Bot API client
+internal/train/         self-play, data format, optimizer
+
+internal/events/        message contracts shared by all services
+internal/bus/           message bus abstraction and NATS implementation
 ```
 
 ## Move generation
