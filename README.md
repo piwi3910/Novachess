@@ -12,6 +12,7 @@ evaluation, UCI and the Lichess client are not yet implemented.
 |---|---|
 | Board representation, bitboards, magics | done |
 | Legal move generation, make/unmake, Zobrist | done, perft-verified |
+| Game termination rules (draws, mate, stalemate) | done |
 | Pipeline message contracts and bus abstraction | done |
 | Search (alpha-beta, TT, quiescence) | not started |
 | Evaluation (hand-crafted, then NNUE) | not started |
@@ -92,19 +93,48 @@ for identical inputs.
 
 ## Correctness
 
-Move generation is gated by perft — counting the leaf nodes of the move tree and
-comparing against published exact values. Seven standard positions are verified,
-chosen to cover the rules that are easiest to get wrong: en passant pins,
-castling rights revoked by rook captures, and underpromotions.
+Move generation is checked four independent ways, because each catches
+something the others can miss.
+
+**Perft** counts the leaf nodes of the move tree and compares against published
+exact values, across seven standard positions verified to full depth (~610M
+nodes). These positions are chosen to cover the rules that are easiest to get
+wrong: en passant pins, castling rights revoked by rook captures, and
+underpromotions.
+
+**A differential test against a naive reference generator** compares move sets,
+not just counts. The reference generates every pseudo-legal move by brute force,
+plays each one, and keeps it if the king is not left attacked — legality
+transcribed directly, with no pin masks to be wrong about. It shares nothing
+with the real generator but the attack tables, and the two must agree exactly
+across tens of thousands of positions reached by random play. Perft alone could
+not catch two compensating bugs that cancel in the total.
+
+**A mirror symmetry test** requires perft counts to be unchanged when a position
+is reflected vertically and its colors swapped. Any difference is a bug treating
+one color differently from the other. Its value is that it needs no published
+counts, so it applies to positions nobody has tabulated.
+
+**Make/unmake reversibility and incremental-vs-recomputed Zobrist agreement**
+are tested separately, since perft would not catch a hash that drifts or an
+unmake that restores an equivalent-but-differently-represented position.
 
 ```
-go test ./...                      # shallow perft, seconds
+go test ./...                      # everything except the deep counts, seconds
 go test ./... -perft-full          # full depth, ~610M nodes
 ```
 
-Make/unmake reversibility and incremental-vs-recomputed Zobrist agreement are
-tested separately, since perft alone would not catch a hash that drifts or an
-unmake that restores an equivalent-but-different position.
+## Rules coverage
+
+Fully implemented: all piece movement, castling and its rights, en passant
+including the discovered-check case, promotion and underpromotion, check,
+checkmate, stalemate, the fifty-move rule, threefold repetition and insufficient
+material.
+
+Not implemented: **Chess960**. Castling is encoded as the king's origin and
+destination on the standard squares, which is correct for orthodox chess and
+wrong for Fischer random. The Lichess bot will need to decline Chess960
+challenges until this changes.
 
 ## Building
 
