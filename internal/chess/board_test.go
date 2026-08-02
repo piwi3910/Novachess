@@ -35,7 +35,9 @@ func TestFENRoundTrip(t *testing.T) {
 		"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
 		"r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
 		"4k3/8/8/8/8/8/8/4K3 w - - 0 1",
-		"rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
+		// The en passant target survives because the pawn on e5 can actually
+		// capture on d6.
+		"rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
 		"8/8/8/8/8/8/6k1/4K2R w K - 13 47",
 	}
 
@@ -48,6 +50,47 @@ func TestFENRoundTrip(t *testing.T) {
 		if got := p.FEN(); got != fen {
 			t.Errorf("FEN round trip: got %q, want %q", got, fen)
 		}
+	}
+}
+
+// TestFENNormalization documents where a FEN deliberately does not round trip.
+// A castling right whose rook is absent, or an en passant target no pawn can
+// use, describes something the board contradicts. Both are dropped, so the
+// rendered FEN is the corrected one — see sanitize for why believing them is
+// worse than rewriting them.
+func TestFENNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "unusable en passant target is dropped",
+			in:   "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2",
+			want: "rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+		},
+		{
+			name: "castling rights without rooks are dropped",
+			in:   "4k3/8/8/8/8/8/8/4K3 w KQkq - 0 1",
+			want: "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+		},
+		{
+			name: "only the unsupported right is dropped",
+			in:   "4k3/8/8/8/8/8/8/R3K3 w KQ - 0 1",
+			want: "4k3/8/8/8/8/8/8/R3K3 w Q - 0 1",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParseFEN(tc.in)
+			if err != nil {
+				t.Fatalf("ParseFEN(%q): %v", tc.in, err)
+			}
+			if got := p.FEN(); got != tc.want {
+				t.Errorf("normalized FEN = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

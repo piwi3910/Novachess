@@ -133,22 +133,30 @@ func (p *Position) genCastling(ml *MoveList, us Color, occ Bitboard) {
 		emptyPath Bitboard
 		kingPath  [2]Square
 		from, to  Square
+		rookFrom  Square
 	}
 	var specs [2]castlingSpec
 	if us == White {
 		specs = [2]castlingSpec{
-			{WhiteKingSide, F1.BB() | G1.BB(), [2]Square{F1, G1}, E1, G1},
-			{WhiteQueenSide, B1.BB() | C1.BB() | D1.BB(), [2]Square{D1, C1}, E1, C1},
+			{WhiteKingSide, F1.BB() | G1.BB(), [2]Square{F1, G1}, E1, G1, H1},
+			{WhiteQueenSide, B1.BB() | C1.BB() | D1.BB(), [2]Square{D1, C1}, E1, C1, A1},
 		}
 	} else {
 		specs = [2]castlingSpec{
-			{BlackKingSide, F8.BB() | G8.BB(), [2]Square{F8, G8}, E8, G8},
-			{BlackQueenSide, B8.BB() | C8.BB() | D8.BB(), [2]Square{D8, C8}, E8, C8},
+			{BlackKingSide, F8.BB() | G8.BB(), [2]Square{F8, G8}, E8, G8, H8},
+			{BlackQueenSide, B8.BB() | C8.BB() | D8.BB(), [2]Square{D8, C8}, E8, C8, A8},
 		}
 	}
 
 	for _, s := range specs {
 		if !p.castling.Has(s.right) || occ&s.emptyPath != 0 {
+			continue
+		}
+		// Rights are sanitized when a position is parsed and revoked whenever
+		// a king or rook square is touched, so this should never fire. It is
+		// checked anyway because the alternative failure mode is relocating a
+		// piece that does not exist, which panics rather than plays a bad move.
+		if p.board[s.rookFrom] != MakePiece(us, Rook) {
 			continue
 		}
 		// b1/b8 may be attacked during queenside castling — only the squares

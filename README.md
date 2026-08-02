@@ -126,15 +126,45 @@ go test ./... -perft-full          # full depth, ~610M nodes
 
 ## Rules coverage
 
-Fully implemented: all piece movement, castling and its rights, en passant
-including the discovered-check case, promotion and underpromotion, check,
-checkmate, stalemate, the fifty-move rule, threefold repetition and insufficient
-material.
+Classical chess is fully implemented.
 
-Not implemented: **Chess960**. Castling is encoded as the king's origin and
-destination on the standard squares, which is correct for orthodox chess and
-wrong for Fischer random. The Lichess bot will need to decline Chess960
-challenges until this changes.
+**Moves.** All piece movement. Castling on both wings for both colors, with
+rights revoked when the king moves, when a rook moves, and when a rook is
+captured on its home square — the last being the case that is easiest to miss.
+Castling is refused out of check, through an attacked square and into check,
+while correctly permitting the queenside castle when only b1/b8 is attacked,
+since the king does not cross it. En passant, including the discovered-check
+case where vacating two squares on one rank exposes the king, and including
+captures that resolve a check. Promotion is mandatory on reaching the back rank
+and offers all four pieces.
+
+**Game end.** Checkmate, stalemate, and four drawing rules. FIDE distinguishes
+*claimable* draws (threefold repetition, fifty-move) from *automatic* ones
+(fivefold, seventy-five-move); all four are implemented. Adjudication uses the
+claimable thresholds, which is universal engine convention and what self-play
+requires — a game continuing past a threefold repetition because neither side
+"claimed" would never end. The automatic thresholds are exposed separately for
+callers that must agree with an external arbiter, which is the Lichess bot's
+situation.
+
+**Positions are normalized on parse.** A FEN asserting a castling right whose
+rook is absent, or an en passant target no pawn can legally use, describes
+something the board contradicts. Both are corrected rather than believed. The
+first was a crash — the generator emitted a castling move and playing it
+relocated a piece that was not there — and FENs arrive from GUIs and web APIs.
+The second matters for draw claims: FIDE distinguishes positions by the moves
+available in them, so an unusable en passant target must not make an otherwise
+identical position hash differently, or a threefold repetition goes undetected.
+
+**Known limits.** Insufficient material covers the material-based subset of
+FIDE 5.2.2 — bare kings, king and minor piece, and same-colored bishops. Full
+"dead position" detection, which includes completely locked pawn structures, is
+not tractable and no engine attempts it; the difference only ever costs a draw
+claim in positions that are drawn anyway.
+
+**Chess960 is not supported.** Castling is encoded as the king's origin and
+destination on the standard squares, correct for classical chess and wrong for
+Fischer random. The Lichess bot should decline Chess960 challenges.
 
 ## Building
 

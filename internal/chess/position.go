@@ -255,10 +255,20 @@ func (p *Position) MakeMove(m Move) {
 		p.movePiece(from, to)
 		if moved.Type() == Pawn {
 			p.halfmove = 0
-			// A double push sets the en passant target square behind the pawn.
+			// A double push sets the en passant target square behind the pawn,
+			// but only when an opponent pawn can actually capture there.
+			//
+			// This is a rules requirement, not an optimization. FIDE compares
+			// positions for repetition by the moves available in them, so two
+			// positions differing only by an en passant target that no pawn
+			// could ever use are the same position and must hash identically.
+			// Recording the square unconditionally would make a threefold
+			// repetition go undetected, losing a draw the rules grant.
 			if abs(int(to)-int(from)) == 16 {
-				p.epSquare = Square(int(from) + PawnPush(us))
-				p.key ^= zobristEPFile[p.epSquare.File()]
+				if epSq := Square(int(from) + PawnPush(us)); p.epCaptureAvailable(epSq, them) {
+					p.epSquare = epSq
+					p.key ^= zobristEPFile[epSq.File()]
+				}
 			}
 		}
 	}
@@ -330,6 +340,44 @@ func (p *Position) UnmakeMove() {
 	// The incremental XORs above have scrambled the key; the saved one is
 	// authoritative and cheaper than undoing each term.
 	p.key = u.key
+}
+
+// epCaptureAvailable reports whether the given side has a pawn that can legally
+// capture en passant onto epSq.
+//
+// "Legally" is doing real work here: a pawn may attack the square and still be
+// unable to make the capture, because en passant removes two pieces from one
+// rank at once and can expose its own king. Such a position has no en passant
+// possibility at all, and must not record one.
+func (p *Position) epCaptureAvailable(epSq Square, capturer Color) bool {
+	if epSq >= NoSquare || p.board[epSq] != NoPiece {
+		return false
+	}
+	them := capturer.Opposite()
+
+	// The pawn to be captured must actually be standing beside the target.
+	capSq := Square(int(epSq) - PawnPush(capturer))
+	if p.board[capSq] != MakePiece(them, Pawn) {
+		return false
+	}
+
+	// Squares from which a pawn of the capturing color attacks epSq are the
+	// squares a pawn of the opposite color standing on epSq would attack.
+	candidates := PawnAttacks[them][epSq] & p.ColorPiecesOfType(capturer, Pawn)
+	if candidates == 0 {
+		return false
+	}
+
+	ksq := p.KingSquare(capturer)
+	occ := p.Occupied()
+	for candidates != 0 {
+		var from Square
+		from, candidates = candidates.PopFirst()
+		if p.enPassantLegal(from, epSq, capturer, ksq, occ) {
+			return true
+		}
+	}
+	return false
 }
 
 // castlingRookSquares maps the king's destination square to the rook's origin
@@ -440,9 +488,56 @@ func ParseFEN(fen string) (*Position, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
+	p.sanitize()
 
 	p.key = p.computeKey()
 	return p, nil
+}
+
+// sanitize corrects fields that a FEN may assert but the board contradicts.
+//
+// These are silently repaired rather than rejected, because FENs arrive from
+// GUIs, opening books and web APIs that are routinely sloppy about them, and
+// refusing an otherwise perfectly legal position over a stale castling flag
+// would break interoperability for no benefit. What must not happen is
+// believing them.
+func (p *Position) sanitize() {
+	p.sanitizeCastlingRights()
+
+	// An en passant target no pawn can legally use is not part of the
+	// position: FIDE distinguishes positions by the moves available in them.
+	// Keeping it would hash this position differently from the identical one
+	// reached by another move order, hiding a repetition draw.
+	if p.epSquare != NoSquare && !p.epCaptureAvailable(p.epSquare, p.side) {
+		p.epSquare = NoSquare
+	}
+}
+
+// sanitizeCastlingRights drops any right whose king or rook is not standing on
+// its home square.
+//
+// Trusting the FEN here is a crash, not merely a wrong move: the generator
+// would emit a castling move, and making it would relocate a piece that is not
+// there. A malformed position arriving over UCI must not be able to take the
+// engine down mid-game.
+func (p *Position) sanitizeCastlingRights() {
+	for _, r := range [...]struct {
+		right      CastlingRights
+		color      Color
+		king, rook Square
+	}{
+		{WhiteKingSide, White, E1, H1},
+		{WhiteQueenSide, White, E1, A1},
+		{BlackKingSide, Black, E8, H8},
+		{BlackQueenSide, Black, E8, A8},
+	} {
+		if !p.castling.Has(r.right) {
+			continue
+		}
+		if p.board[r.king] != MakePiece(r.color, King) || p.board[r.rook] != MakePiece(r.color, Rook) {
+			p.castling &^= r.right
+		}
+	}
 }
 
 // validate rejects positions the move generator would misbehave on. It is

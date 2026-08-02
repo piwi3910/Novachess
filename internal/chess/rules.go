@@ -107,13 +107,39 @@ func (p *Position) Outcome() (Outcome, TerminationReason) {
 	return Ongoing, NotTerminated
 }
 
+// FIDE draws come in two kinds, and the distinction matters for anything that
+// has to agree with an external arbiter.
+//
+// The fifty-move rule and threefold repetition are *claimable*: the game
+// continues unless a player claims the draw. The seventy-five-move rule and
+// fivefold repetition are *automatic*: the arbiter ends the game whether or not
+// anyone asks.
+//
+// This engine adjudicates on the claimable thresholds, which is universal
+// engine convention and what self-play needs — a game that continues past a
+// threefold repetition because neither side "claimed" would run forever. The
+// automatic thresholds are exposed separately for callers that must match a
+// server's adjudication, which is the Lichess bot's situation.
+const (
+	fiftyMovePlies       = 100
+	seventyFiveMovePlies = 150
+)
+
 // IsFiftyMoveRule reports whether a hundred plies have passed with no capture
-// and no pawn move.
+// and no pawn move. This is the claimable draw of FIDE 9.3.
 //
 // The caller must still confirm the side to move has a legal move: a position
 // that is checkmate on the hundredth ply is a win, not a draw. Outcome handles
 // that ordering.
-func (p *Position) IsFiftyMoveRule() bool { return p.halfmove >= 100 }
+func (p *Position) IsFiftyMoveRule() bool { return p.halfmove >= fiftyMovePlies }
+
+// IsSeventyFiveMoveRule reports whether a hundred and fifty plies have passed
+// with no capture and no pawn move. This is the automatic draw of FIDE 9.6.2,
+// which needs no claim from either player.
+//
+// Outcome never reports it, because it draws at the claimable fifty-move
+// threshold first. It exists for callers reconciling with an external arbiter.
+func (p *Position) IsSeventyFiveMoveRule() bool { return p.halfmove >= seventyFiveMovePlies }
 
 // RepetitionCount returns how many times the current position has previously
 // occurred in this game with the same side to move.
@@ -147,8 +173,17 @@ func (p *Position) RepetitionCount() int {
 }
 
 // IsThreefoldRepetition reports whether the current position has occurred three
-// times, counting the present occurrence.
+// times, counting the present occurrence. This is the claimable draw of FIDE
+// 9.2.
 func (p *Position) IsThreefoldRepetition() bool { return p.RepetitionCount() >= 2 }
+
+// IsFivefoldRepetition reports whether the current position has occurred five
+// times. This is the automatic draw of FIDE 9.6.1, which needs no claim.
+//
+// As with the seventy-five-move rule, Outcome never reports it because it draws
+// at the threefold threshold first; it exists for callers reconciling with an
+// external arbiter.
+func (p *Position) IsFivefoldRepetition() bool { return p.RepetitionCount() >= 4 }
 
 // IsRepetition reports whether the current position has occurred before at all.
 //
@@ -167,6 +202,13 @@ func (p *Position) IsRepetition() bool { return p.RepetitionCount() >= 1 }
 // bishops on the same color. Positions where mate is merely unreachable against
 // correct defence — king and two knights against a bare king, for instance —
 // are not draws by this rule, because mate remains possible with cooperation.
+//
+// FIDE 5.2.2 is strictly broader than this: a "dead position" is any position
+// from which no series of legal moves can produce mate, which includes
+// pawn structures locked so completely that neither king can ever break
+// through. Detecting that in general is not tractable, and no engine attempts
+// it; the material-based subset here is the universal practical reading. The
+// difference only ever costs a draw claim in positions that are drawn anyway.
 func (p *Position) IsInsufficientMaterial() bool {
 	// Any pawn, rook or queen leaves mate possible.
 	if p.byType[Pawn]|p.byType[Rook]|p.byType[Queen] != 0 {
