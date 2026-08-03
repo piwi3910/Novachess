@@ -40,15 +40,29 @@ export default function Generation({
   const etaSeconds = generation.target ? eta(generation.positions, generation.target, r) : null;
   const pct = generation.target ? Math.min(100, (generation.positions / generation.target) * 100) : null;
 
-  async function run(action: string) {
+  async function run(action: string, force = false) {
     setPending(action);
     setError(null);
     setNotice(null);
     try {
-      await post(`/api/selfplay/${action}`);
-      setNotice(ACTION_DONE[action] ?? `${action} done`);
+      await post(`/api/selfplay/${action}`, action === "start" ? { force } : undefined);
+      if (action === "start" && force) {
+        setNotice(`Started — redoing generation ${generation.generation}`);
+      } else {
+        setNotice(ACTION_DONE[action] ?? `${action} done`);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (action === "start" && !force && /complete/i.test(msg)) {
+        const confirmed = window.confirm(
+          `Generation ${generation.generation}'s dataset is already complete - starting will redo finished work. Start anyway?`,
+        );
+        if (confirmed) {
+          await run("start", true);
+          return;
+        }
+      }
+      setError(msg);
     } finally {
       setPending(null);
     }

@@ -293,7 +293,13 @@ func (s *Server) selfplay(w http.ResponseWriter, r *http.Request) {
 	case "stop":
 		err = s.ctl.StopSelfplay(ctx)
 	case "start":
-		err = s.ctl.StartSelfplay(ctx)
+		var body struct {
+			Force bool `json:"force"`
+		}
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		err = s.ctl.StartSelfplay(ctx, body.Force)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("dashboard: unknown selfplay action %q", action))
 		return

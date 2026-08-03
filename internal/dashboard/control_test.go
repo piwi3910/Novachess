@@ -19,14 +19,20 @@ import (
 // state. It deliberately does not use the k8s fake clientset - this layer's
 // tests care about call sequencing and arguments, not resource manifests.
 type fakeCluster struct {
-	scales       map[string][]int32
-	replicas     map[string]int32
-	coordGen     []int
-	coordURI     []string
-	jobs         []string
-	jobCommands  [][]string
-	jobArgs      [][]string
-	jobCronNames []string
+	scales   map[string][]int32
+	replicas map[string]int32
+	coordGen []int
+	coordURI []string
+
+	// coordinatorGeneration stands in for the coordinator Deployment's
+	// NOVA_GENERATION env var - what CoordinatorGeneration reads. It defaults
+	// to 0, the template's starting value, and SetCoordinatorGeneration
+	// updates it exactly as the real cluster's env patch would.
+	coordinatorGeneration int
+	jobs                  []string
+	jobCommands           [][]string
+	jobArgs               [][]string
+	jobCronNames          []string
 
 	// cronCommand and cronArgs stand in for the real CronJob templates in
 	// deploy/jobs.yaml, tuned flags included, so tests can assert that a
@@ -113,8 +119,13 @@ func (f *fakeCluster) Scale(_ context.Context, d string, n int32) error {
 func (f *fakeCluster) SetCoordinatorGeneration(_ context.Context, generation int, networkURI string) error {
 	f.coordGen = append(f.coordGen, generation)
 	f.coordURI = append(f.coordURI, networkURI)
+	f.coordinatorGeneration = generation
 	f.calls = append(f.calls, fmt.Sprintf("setgen:%d", generation))
 	return nil
+}
+
+func (f *fakeCluster) CoordinatorGeneration(_ context.Context) (int, error) {
+	return f.coordinatorGeneration, nil
 }
 
 func (f *fakeCluster) CreateJobFromCron(_ context.Context, cronName, jobName string, rewrite func(string) string) error {
@@ -180,10 +191,14 @@ func TestCoordinatorCanNeverExceedOne(t *testing.T) {
 	ct := NewController(fc, h, dataDir, 4)
 
 	// Walk every public control method that touches the coordinator.
+	// StartSelfplay is forced here - the history holds no dataset record for
+	// generation 0 in this test, so an unforced call would also pass, but
+	// forcing keeps this walk's intent (exercise the scaling path) explicit
+	// rather than incidental on that empty-history detail.
 	_ = ct.PauseSelfplay(ctx)
 	_ = ct.ResumeSelfplay(ctx)
 	_ = ct.StopSelfplay(ctx)
-	_ = ct.StartSelfplay(ctx)
+	_ = ct.StartSelfplay(ctx, true)
 	_, _ = ct.StartTrainer(ctx, 0, true)
 	_, _ = ct.StartGatekeeper(ctx, 0)
 	_ = ct.AdvanceGeneration(ctx, 1)
@@ -195,6 +210,54 @@ func TestCoordinatorCanNeverExceedOne(t *testing.T) {
 	}
 	if len(fc.scales[DeployCoordinator]) == 0 {
 		t.Fatal("expected at least one coordinator scale call")
+	}
+}
+
+// TestStartRefusedWhenGenerationComplete checks that StartSelfplay refuses
+// to restart the coordinator for a generation the history already holds a
+// completed dataset for - a restarted coordinator would redo that generation
+// from scratch. force overrides the refusal.
+func TestStartRefusedWhenGenerationComplete(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	if err := h.Append(Record{Type: "dataset", Generation: 0, Positions: 1000000, At: time.Now()}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	fc := newFakeCluster() // coordinator env NOVA_GENERATION=0 in its template
+	ct := NewController(fc, h, dataDir, 8)
+
+	err := ct.StartSelfplay(ctx, false)
+	var re *RefusedError
+	if !errors.As(err, &re) {
+		t.Fatalf("want RefusedError, got %v", err)
+	}
+	if len(fc.calls) != 0 {
+		t.Fatal("a refused start must not touch the cluster")
+	}
+	if err := ct.StartSelfplay(ctx, true); err != nil {
+		t.Fatalf("force must override: %v", err)
+	}
+}
+
+// TestStartAllowedWhenGenerationOpen checks the converse: with no dataset
+// record for the coordinator's configured generation, StartSelfplay succeeds
+// and scales the coordinator and workers up.
+func TestStartAllowedWhenGenerationOpen(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	fc := newFakeCluster()
+	ct := NewController(fc, h, dataDir, 8)
+
+	if err := ct.StartSelfplay(ctx, false); err != nil {
+		t.Fatalf("StartSelfplay: %v", err)
+	}
+	if got := fc.replicas[DeployCoordinator]; got != 1 {
+		t.Fatalf("expected coordinator scaled to 1, got %d", got)
+	}
+	if got := fc.replicas[DeployWorkers]; got != 8 {
+		t.Fatalf("expected workers scaled to 8, got %d", got)
 	}
 }
 

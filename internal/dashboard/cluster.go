@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,11 @@ type Cluster interface {
 	Replicas(ctx context.Context, deployment string) (int32, error)
 	Scale(ctx context.Context, deployment string, replicas int32) error
 	SetCoordinatorGeneration(ctx context.Context, generation int, networkURI string) error
+	// CoordinatorGeneration reads the coordinator Deployment's currently
+	// configured NOVA_GENERATION env var - the generation it will (re)run
+	// self-play for the next time it starts. A coordinator template with no
+	// such env defaults to 0, matching the binary's own default.
+	CoordinatorGeneration(ctx context.Context) (int, error)
 	// CreateJobFromCron launches a one-shot Job from the named suspended
 	// CronJob's template. rewrite, if non-nil, is applied to every element
 	// of the template's Command and Args in place - not a wholesale
@@ -145,6 +151,27 @@ func (c *k8sCluster) SetCoordinatorGeneration(ctx context.Context, generation in
 	d.Spec.Template.Spec.Containers[0].Env = env
 	_, err = deps.Update(ctx, d, metav1.UpdateOptions{})
 	return err
+}
+
+// CoordinatorGeneration reads the coordinator Deployment's NOVA_GENERATION
+// env var. Missing env or an unparsable value both default to 0, which is
+// the generation the coordinator binary itself defaults to when the env is
+// absent.
+func (c *k8sCluster) CoordinatorGeneration(ctx context.Context) (int, error) {
+	d, err := c.cs.AppsV1().Deployments(c.namespace).Get(ctx, DeployCoordinator, metav1.GetOptions{})
+	if err != nil {
+		return 0, err
+	}
+	for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "NOVA_GENERATION" {
+			n, err := strconv.Atoi(e.Value)
+			if err != nil {
+				return 0, nil
+			}
+			return n, nil
+		}
+	}
+	return 0, nil
 }
 
 func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName string, rewrite func(string) string) error {
