@@ -1,16 +1,15 @@
 import { useState, type ReactNode } from "react";
 import type { HistoryRecord } from "../types";
-import { parseEpochLine } from "../lib";
 import { post } from "../api";
 
 const CHART_W = 480;
 const CHART_H = 160;
 const PAD = 28;
 
-function LossChart({ lines }: { lines: string[] }) {
-  const points = lines
-    .map(parseEpochLine)
-    .filter((p): p is { epoch: number; loss: number } => p !== null);
+// Points are parsed once, on arrival, by the caller (App.tsx) via
+// lib.ts's parseEpochLine - this component only ever sees the already
+// bounded, already parsed series, never the raw log.
+function LossChart({ points }: { points: Array<{ epoch: number; loss: number }> }) {
   if (points.length < 2) return null;
 
   const maxEpoch = Math.max(...points.map((p) => p.epoch));
@@ -61,11 +60,13 @@ function verdictCell(gate: HistoryRecord | undefined): ReactNode {
 export default function Training({
   generation,
   history,
-  trainLog,
+  epochs,
+  tailLines,
 }: {
   generation: number;
   history: HistoryRecord[];
-  trainLog: string[];
+  epochs: Array<{ epoch: number; loss: number }>;
+  tailLines: string[];
 }) {
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -123,10 +124,10 @@ export default function Training({
   return (
     <section>
       <h2>Training</h2>
-      {trainLog.length > 0 && (
+      {tailLines.length > 0 && (
         <>
-          <LossChart lines={trainLog} />
-          <div className="log-lines">{trainLog.slice(-10).join("\n")}</div>
+          <LossChart points={epochs} />
+          <div className="log-lines">{tailLines.join("\n")}</div>
         </>
       )}
 

@@ -1,16 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import type { HistoryRecord, Snapshot } from "./types";
 import { getHistory, getState, stream } from "./api";
+import { parseEpochLine } from "./lib";
 import Boards from "./components/Boards";
 import Generation from "./components/Generation";
 import Training from "./components/Training";
 
 const SAMPLE_WINDOW = 30;
+// Bounds the retained trainlog state for the life of the tab across a
+// multi-hour run: the epoch series is capped generously above any real
+// trainer -epochs value, and only the tail of raw lines is kept for display.
+const MAX_EPOCH_POINTS = 500;
+const TAIL_LINES = 10;
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [history, setHistory] = useState<HistoryRecord[]>([]);
-  const [trainLog, setTrainLog] = useState<string[]>([]);
+  const [epochs, setEpochs] = useState<Array<{ epoch: number; loss: number }>>([]);
+  const [tailLines, setTailLines] = useState<string[]>([]);
   const samplesRef = useRef<Array<[number, number]>>([]);
   const [, forceRender] = useState(0);
 
@@ -28,7 +35,20 @@ export default function App() {
         forceRender((n) => n + 1);
       },
       (line) => {
-        setTrainLog((prev) => [...prev, line]);
+        // Parse once on arrival with the single lib.ts parser; keep only the
+        // parsed point (bounded series) and the raw line's tail, never the
+        // unbounded raw log.
+        const point = parseEpochLine(line);
+        if (point) {
+          setEpochs((prev) => {
+            const next = [...prev, point];
+            return next.length > MAX_EPOCH_POINTS ? next.slice(-MAX_EPOCH_POINTS) : next;
+          });
+        }
+        setTailLines((prev) => {
+          const next = [...prev, line];
+          return next.length > TAIL_LINES ? next.slice(-TAIL_LINES) : next;
+        });
       },
     );
 
@@ -54,7 +74,8 @@ export default function App() {
       <Training
         generation={snapshot?.generation.generation ?? 0}
         history={history}
-        trainLog={trainLog}
+        epochs={epochs}
+        tailLines={tailLines}
       />
     </div>
   );
