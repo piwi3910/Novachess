@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -54,6 +55,23 @@ type fakeCluster struct {
 	// Active to terminal across several polls.
 	jobResponses []JobState
 	jobCalls     int
+
+	// metrics and metricsErr back Metrics(); metricsErr, when set, makes
+	// every call fail until cleared, so tests can simulate metrics-server
+	// being briefly unavailable. Guarded by metricsMu since the metrics
+	// poller reads them from its own goroutine while a test mutates them.
+	metricsMu  sync.Mutex
+	metrics    map[string]PodMetrics
+	metricsErr error
+}
+
+// setMetrics safely updates the sample and/or error Metrics() returns, for
+// use by tests exercising the concurrent metrics poller.
+func (f *fakeCluster) setMetrics(m map[string]PodMetrics, err error) {
+	f.metricsMu.Lock()
+	defer f.metricsMu.Unlock()
+	f.metrics = m
+	f.metricsErr = err
 }
 
 func newFakeCluster() *fakeCluster {
@@ -117,6 +135,15 @@ func (f *fakeCluster) Job(_ context.Context, name string) (JobState, error) {
 		idx = len(f.jobResponses) - 1
 	}
 	return f.jobResponses[idx], nil
+}
+
+func (f *fakeCluster) Metrics(_ context.Context) (map[string]PodMetrics, error) {
+	f.metricsMu.Lock()
+	defer f.metricsMu.Unlock()
+	if f.metricsErr != nil {
+		return nil, f.metricsErr
+	}
+	return f.metrics, nil
 }
 
 func (f *fakeCluster) StreamJobLogs(_ context.Context, _ string) (io.ReadCloser, error) {

@@ -51,6 +51,7 @@ type Server struct {
 	trainerRetryCap      time.Duration // give up opening the log after this long
 	gatePollInterval     time.Duration // how often to poll Job() for terminal state
 	gateTimeout          time.Duration // give up waiting for the gate job after this long
+	metricsInterval      time.Duration // how often to poll Cluster.Metrics
 }
 
 // ServerOption configures optional Server behaviour at construction time.
@@ -74,6 +75,14 @@ func WithFollowerIntervals(trainerRetryInterval, trainerRetryCap, gatePollInterv
 	}
 }
 
+// WithMetricsInterval overrides how often the server polls Cluster.Metrics.
+// Production uses the NewServer default of 15 seconds (metrics-server's own
+// resolution); tests inject a short interval so the poller's effect on State
+// is observable quickly.
+func WithMetricsInterval(d time.Duration) ServerOption {
+	return func(s *Server) { s.metricsInterval = d }
+}
+
 // NewServer builds the dashboard's HTTP handler. ctx is the server's
 // lifetime context: cancelling it (on shutdown) stops any in-flight job
 // followers rather than leaking them.
@@ -90,10 +99,12 @@ func NewServer(ctx context.Context, s *State, h *History, ctl *Controller, clust
 		trainerRetryCap:      2 * time.Minute,
 		gatePollInterval:     10 * time.Second,
 		gateTimeout:          6 * time.Hour,
+		metricsInterval:      15 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(srv)
 	}
+	go srv.pollMetrics(ctx)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", srv.getState)
 	mux.HandleFunc("GET /api/history", srv.getHistory)
@@ -455,6 +466,39 @@ func (s *Server) awaitGate(ctx context.Context, jobName string, generation int) 
 		if err := s.history.Append(promo); err != nil {
 			s.log.Error("appending promotion history record", "job", jobName, "generation", generation, "error", err)
 		}
+	}
+}
+
+// pollMetrics samples Cluster.Metrics on metricsInterval for the life of ctx
+// and joins each sample onto State. A cluster with no metrics-server
+// installed (or one that is briefly unreachable) fails every call - that is
+// expected and must not stop the poller, only degrade the boards to cards
+// without graphs. The failing latch logs once when the streak starts and
+// once when it clears, rather than once per tick, so a prolonged outage
+// doesn't spam the log every interval.
+func (s *Server) pollMetrics(ctx context.Context) {
+	ticker := time.NewTicker(s.metricsInterval)
+	defer ticker.Stop()
+	failing := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		m, err := s.cluster.Metrics(ctx)
+		if err != nil {
+			if !failing {
+				failing = true
+				s.log.Error("polling pod metrics", "error", err)
+			}
+			continue
+		}
+		if failing {
+			failing = false
+			s.log.Info("polling pod metrics recovered")
+		}
+		s.state.NoteMetrics(m)
 	}
 }
 
