@@ -96,6 +96,39 @@ func TestControlEndpointsCallController(t *testing.T) {
 	}
 }
 
+// TestSelfplayStartRefusedWhenGenerationComplete exercises the HTTP surface
+// of the Start guardrail: a dataset record already on file for the
+// coordinator's generation means POST /api/selfplay/start refuses with a
+// 409 mentioning "complete", and {"force":true} overrides it.
+func TestSelfplayStartRefusedWhenGenerationComplete(t *testing.T) {
+	s := NewState()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	if err := h.Append(Record{Type: "dataset", Generation: 0, Positions: 1000000, At: time.Now()}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	fc := newFakeCluster()
+	ct := NewController(fc, h, dataDir, 4)
+	srv := NewServer(context.Background(), s, h, ct, fc)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/selfplay/start", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "complete") {
+		t.Fatalf("expected body to mention complete, got %s", w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/selfplay/start", strings.NewReader(`{"force":true}`))
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("forced start status = %d, body = %s", w.Code, w.Body.String())
+	}
+}
+
 func TestSSESendsStateOnChange(t *testing.T) {
 	s := NewState()
 	dataDir := t.TempDir()

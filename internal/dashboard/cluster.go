@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	metricsversioned "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 const (
@@ -43,6 +45,11 @@ type Cluster interface {
 	Replicas(ctx context.Context, deployment string) (int32, error)
 	Scale(ctx context.Context, deployment string, replicas int32) error
 	SetCoordinatorGeneration(ctx context.Context, generation int, networkURI string) error
+	// CoordinatorGeneration reads the coordinator Deployment's currently
+	// configured NOVA_GENERATION env var - the generation it will (re)run
+	// self-play for the next time it starts. A coordinator template with no
+	// such env defaults to 0, matching the binary's own default.
+	CoordinatorGeneration(ctx context.Context) (int, error)
 	// CreateJobFromCron launches a one-shot Job from the named suspended
 	// CronJob's template. rewrite, if non-nil, is applied to every element
 	// of the template's Command and Args in place - not a wholesale
@@ -53,10 +60,16 @@ type Cluster interface {
 	CreateJobFromCron(ctx context.Context, cronName, jobName string, rewrite func(element string) string) error
 	Job(ctx context.Context, name string) (JobState, error)
 	StreamJobLogs(ctx context.Context, jobName string) (io.ReadCloser, error)
+	// Metrics returns current CPU/memory usage for every pod in the
+	// namespace, keyed by pod name, as reported by metrics-server. A cluster
+	// without metrics-server installed returns an error every call - callers
+	// must degrade gracefully (cards without graphs), not treat it as fatal.
+	Metrics(ctx context.Context) (map[string]PodMetrics, error)
 }
 
 type k8sCluster struct {
 	cs        kubernetes.Interface
+	metrics   metricsversioned.Interface
 	namespace string
 }
 
@@ -71,10 +84,19 @@ func NewCluster(namespace string) (Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newClusterWith(cs, namespace), nil
+	mc, err := metricsversioned.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	c := newClusterWith(cs, namespace)
+	c.metrics = mc
+	return c, nil
 }
 
 // newClusterWith is the unexported seam tests use with the fake clientset.
+// The metrics client is not part of this seam - it rides only the real
+// NewCluster path, since metrics-server has no clientset fake worth using
+// here; tests exercise Metrics through the Cluster interface instead.
 func newClusterWith(cs kubernetes.Interface, namespace string) *k8sCluster {
 	return &k8sCluster{cs: cs, namespace: namespace}
 }
@@ -129,6 +151,27 @@ func (c *k8sCluster) SetCoordinatorGeneration(ctx context.Context, generation in
 	d.Spec.Template.Spec.Containers[0].Env = env
 	_, err = deps.Update(ctx, d, metav1.UpdateOptions{})
 	return err
+}
+
+// CoordinatorGeneration reads the coordinator Deployment's NOVA_GENERATION
+// env var. Missing env or an unparsable value both default to 0, which is
+// the generation the coordinator binary itself defaults to when the env is
+// absent.
+func (c *k8sCluster) CoordinatorGeneration(ctx context.Context) (int, error) {
+	d, err := c.cs.AppsV1().Deployments(c.namespace).Get(ctx, DeployCoordinator, metav1.GetOptions{})
+	if err != nil {
+		return 0, err
+	}
+	for _, e := range d.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "NOVA_GENERATION" {
+			n, err := strconv.Atoi(e.Value)
+			if err != nil {
+				return 0, nil
+			}
+			return n, nil
+		}
+	}
+	return 0, nil
 }
 
 func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName string, rewrite func(string) string) error {
@@ -224,4 +267,24 @@ func (c *k8sCluster) StreamJobLogs(ctx context.Context, jobName string) (io.Read
 	}
 	req := c.cs.CoreV1().Pods(c.namespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{Follow: true})
 	return req.Stream(ctx)
+}
+
+// Metrics lists the namespace's current PodMetricses and sums usage across
+// each pod's containers. A pod with no metrics recorded yet (just started)
+// is simply absent from the result rather than reported as zero.
+func (c *k8sCluster) Metrics(ctx context.Context) (map[string]PodMetrics, error) {
+	list, err := c.metrics.MetricsV1beta1().PodMetricses(c.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]PodMetrics, len(list.Items))
+	for _, pm := range list.Items {
+		var cpu, mem int64
+		for _, cont := range pm.Containers {
+			cpu += cont.Usage.Cpu().MilliValue()
+			mem += cont.Usage.Memory().Value()
+		}
+		out[pm.Name] = PodMetrics{CPUMillicores: cpu, MemoryBytes: mem}
+	}
+	return out, nil
 }

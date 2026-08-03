@@ -117,3 +117,19 @@ func (h *History) HasPromotion(generation int) bool {
 	}
 	return false
 }
+
+// HasDataset reports whether the history holds a "dataset" record for
+// generation - i.e. self-play for that generation has already produced its
+// full dataset. Used to refuse restarting self-play on a generation that is
+// already done, since a restarted coordinator re-runs its generation from
+// scratch.
+func (h *History) HasDataset(generation int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Generation == generation && r.Type == "dataset" {
+			return true
+		}
+	}
+	return false
+}

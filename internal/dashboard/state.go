@@ -30,6 +30,15 @@ type Board struct {
 	GamesCompleted int       `json:"games_completed"`
 	LastSeen       time.Time `json:"last_seen"`
 	Stale          bool      `json:"stale"`
+	CPUMillicores  int64     `json:"cpu_millicores,omitempty"`
+	MemoryBytes    int64     `json:"memory_bytes,omitempty"`
+}
+
+// PodMetrics is one pod's current resource usage, summed across its
+// containers, as read from metrics-server.
+type PodMetrics struct {
+	CPUMillicores int64 `json:"cpu_millicores"`
+	MemoryBytes   int64 `json:"memory_bytes"`
 }
 
 type GenProgress struct {
@@ -75,6 +84,12 @@ func (s *State) SetTarget(target int) {
 
 func (s *State) NoteHeartbeat(hb events.WorkerHeartbeat, at time.Time) {
 	s.mu.Lock()
+	// Carry the metrics fields forward from any existing entry: heartbeats
+	// and metrics polls both land on ~15s cadences and interleave in
+	// whichever order they happen to arrive, so replacing the whole struct
+	// here would blink the cards' CPU/memory to zero roughly every other
+	// heartbeat instead of only once, before the first sample ever arrives.
+	existing := s.boards[hb.WorkerID]
 	s.boards[hb.WorkerID] = Board{
 		WorkerID:       hb.WorkerID,
 		NodeName:       hb.NodeName,
@@ -83,6 +98,28 @@ func (s *State) NoteHeartbeat(hb events.WorkerHeartbeat, at time.Time) {
 		NodesPerSecond: hb.NodesPerSecond,
 		GamesCompleted: hb.GamesCompleted,
 		LastSeen:       at,
+		CPUMillicores:  existing.CPUMillicores,
+		MemoryBytes:    existing.MemoryBytes,
+	}
+	s.mu.Unlock()
+	s.notify()
+}
+
+// NoteMetrics joins a namespace-wide pod usage sample onto the boards that
+// already exist, by pod name. Metrics for pods with no board (not yet
+// heartbeated, or already evicted) are dropped rather than creating a board
+// with no other data — the pod list from metrics-server and the heartbeat
+// stream are independent and need not agree at every instant.
+func (s *State) NoteMetrics(m map[string]PodMetrics) {
+	s.mu.Lock()
+	for id, pm := range m {
+		b, ok := s.boards[id]
+		if !ok {
+			continue
+		}
+		b.CPUMillicores = pm.CPUMillicores
+		b.MemoryBytes = pm.MemoryBytes
+		s.boards[id] = b
 	}
 	s.mu.Unlock()
 	s.notify()

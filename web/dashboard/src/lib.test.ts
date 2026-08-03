@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eta, parseEpochLine, rate, selfplayStatus } from "./lib";
+import { eta, fmtBytes, fmtMillicores, metricScale, parseEpochLine, rate, selfplayStatus } from "./lib";
 
 describe("eta", () => {
   it("is null when done or rate unknown", () => {
@@ -45,5 +45,28 @@ describe("selfplayStatus", () => {
   });
   it("surfaces error strings verbatim", () => {
     expect(selfplayStatus("boom", 0)).toBe("boom");
+  });
+});
+
+describe("metricScale", () => {
+  it("clamps to [0,1]", () => {
+    expect(metricScale(500, 1000)).toBe(0.5);
+    expect(metricScale(2000, 1000)).toBe(1);
+    expect(metricScale(-5, 1000)).toBe(0);
+    expect(metricScale(5, 0)).toBe(0);
+  });
+});
+
+describe("fmtMillicores", () => {
+  it("prints millicores under a core and cores above", () => {
+    expect(fmtMillicores(970)).toBe("970m");
+    expect(fmtMillicores(1500)).toBe("1.50");
+  });
+});
+
+describe("fmtBytes", () => {
+  it("prints Mi and Gi", () => {
+    expect(fmtBytes(212 * 1024 * 1024)).toBe("212Mi");
+    expect(fmtBytes(3 * 1024 * 1024 * 1024)).toBe("3.00Gi");
   });
 });

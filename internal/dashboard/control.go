@@ -144,8 +144,22 @@ func (ct *Controller) StopSelfplay(ctx context.Context) error {
 }
 
 // StartSelfplay brings the coordinator up first, then the workers, so
-// workers never find themselves without a coordinator to report to.
-func (ct *Controller) StartSelfplay(ctx context.Context) error {
+// workers never find themselves without a coordinator to report to. A
+// restarted coordinator re-runs its configured generation from scratch, so
+// starting on a generation whose dataset the history already holds complete
+// would redo finished work - exactly what burned cluster time before this
+// guardrail existed. Unless force is set, that case is refused with a
+// RefusedError (409) rather than acted on.
+func (ct *Controller) StartSelfplay(ctx context.Context, force bool) error {
+	if !force {
+		gen, err := ct.cluster.CoordinatorGeneration(ctx)
+		if err != nil {
+			return err
+		}
+		if ct.history.HasDataset(gen) {
+			return &RefusedError{Reason: fmt.Sprintf("dashboard: generation %d's dataset is already complete; starting now would redo finished work, pass force to restart anyway", gen)}
+		}
+	}
 	if err := ct.scaleCoordinator(ctx, 1); err != nil {
 		return err
 	}

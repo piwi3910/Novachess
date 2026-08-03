@@ -22,6 +22,22 @@ export function fmtNps(nps: number): string {
   return nps >= 1e6 ? (nps / 1e6).toFixed(2) + "M" : Math.round(nps / 1e3) + "k";
 }
 
+// Fraction of a resource ceiling, clamped so a spike over the request or a
+// zero ceiling can never break the bar geometry.
+export function metricScale(value: number, max: number): number {
+  if (max <= 0 || value <= 0) return 0;
+  return Math.min(1, value / max);
+}
+
+export function fmtMillicores(m: number): string {
+  return m < 1000 ? `${Math.round(m)}m` : (m / 1000).toFixed(2);
+}
+
+export function fmtBytes(b: number): string {
+  const mi = b / (1024 * 1024);
+  return mi < 1024 ? `${Math.round(mi)}Mi` : `${(mi / 1024).toFixed(2)}Gi`;
+}
+
 // One line of truth about whether self-play is running, fed by the replica
 // counts the server includes in every state frame. Error strings from the
 // server pass through verbatim rather than being dressed up as a status.

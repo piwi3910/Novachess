@@ -88,6 +88,30 @@ section {
   margin-top: 0.4rem;
 }
 
+.metric-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.3rem;
+}
+
+.metric-row .sparkline {
+  margin-top: 0;
+  flex-shrink: 0;
+}
+
+.metric-label {
+  display: flex;
+  justify-content: space-between;
+  flex: 1;
+  font-size: 0.85rem;
+  color: #9aa4b2;
+}
+
+.board-card.stale .metric-label {
+  color: #d18b8b;
+}
+
 .no-boards {
   color: #6c7684;
   font-style: italic;
