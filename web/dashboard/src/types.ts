@@ -7,6 +7,8 @@ export interface Board {
   games_completed: number;
   last_seen: string;
   stale: boolean;
+  cpu_millicores?: number;
+  memory_bytes?: number;
 }
 export interface GenProgress {
   generation: number;
