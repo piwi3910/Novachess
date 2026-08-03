@@ -11,8 +11,13 @@ package chess
 // entry, and move lists are copied constantly during search. Note that the
 // promotion field is only meaningful when the kind is KindPromotion.
 //
-// For castling, the destination is the king's final square (g1/c1/g8/c8),
-// not the rook's — the standard convention for non-Chess960 play.
+// For castling, the destination is the ROOK's square, not the king's — the
+// move is encoded king-takes-rook. This is the only unambiguous encoding once
+// Chess960 is supported, where the king's destination can already be occupied
+// by the castling rook and the king may not move at all. It also means the
+// destination of a castling move is not where the king ends up: use
+// CastlingDestinations for that. Rendering to UCI restores the conventional
+// e1g1 form for classical play; see Position.MoveToUCI.
 type Move uint16
 
 // MoveNone is the zero Move, used as "no move". It is never a legal move
@@ -46,7 +51,8 @@ func NewEnPassant(from, to Square) Move {
 	return Move(uint16(from) | uint16(to)<<6 | uint16(KindEnPassant))
 }
 
-// NewCastling builds a castling move, with to set to the king's final square.
+// NewCastling builds a castling move: from is the king's square and to is the
+// rook's, not the king's destination. See the note on Move.
 func NewCastling(from, to Square) Move {
 	return Move(uint16(from) | uint16(to)<<6 | uint16(KindCastling))
 }

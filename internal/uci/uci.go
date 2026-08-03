@@ -23,6 +23,7 @@ import (
 
 	"github.com/piwi3910/novachess/internal/chess"
 	"github.com/piwi3910/novachess/internal/eval"
+	"github.com/piwi3910/novachess/internal/nnue"
 	"github.com/piwi3910/novachess/internal/search"
 )
 
@@ -55,6 +56,7 @@ type Engine struct {
 	// options
 	hashMB   int
 	chess960 bool
+	evalFile string
 
 	// searching guards the running search so that "stop" and "quit" can reach
 	// it and so that a second "go" cannot start one on top of another.
@@ -134,8 +136,11 @@ func (e *Engine) execute(line string) bool {
 	case "d", "board":
 		e.send(e.currentPosition().String())
 	case "eval":
+		// Report through the evaluation the search is actually using, not a
+		// fresh hand-crafted one: after loading a network, a hardcoded HCE here
+		// would print a number the engine does not act on.
 		p := e.currentPosition()
-		e.sendf("static evaluation: %d", eval.NewHCE().Evaluate(p))
+		e.sendf("static evaluation: %d (%s)", e.searcher.Evaluator().Evaluate(p), e.evaluationName())
 	case "perft":
 		e.perft(fields[1:])
 	}
@@ -148,6 +153,7 @@ func (e *Engine) identify() {
 	e.sendf("option name Hash type spin default %d min %d max %d", defaultHashMB, minHashMB, maxHashMB)
 	e.sendf("option name Threads type spin default %d min 1 max %d", defaultThreads, search.MaxThreads)
 	e.sendf("option name UCI_Chess960 type check default false")
+	e.sendf("option name EvalFile type string default %s", noEvalFile)
 	e.send("uciok")
 }
 
@@ -196,12 +202,62 @@ func (e *Engine) setOption(args []string) {
 		e.stopSearch()
 		e.searcher.SetThreads(clamp(n, 1, search.MaxThreads))
 
+	case "evalfile":
+		e.setEvalFile(value)
+
 	case "uci_chess960":
 		e.chess960 = strings.EqualFold(value, "true")
 		// Re-parse the current position so its castling notation follows the
 		// new setting; otherwise moves would be echoed in the wrong form.
 		e.setPositionTo(reinterpret(e.currentPosition(), e.chess960))
 	}
+}
+
+// noEvalFile is the EvalFile value meaning "use the hand-crafted evaluation".
+// GUIs commonly send "<empty>" for an unset string option rather than an empty
+// token, and a file literally named that does not exist, so both are treated as
+// unset.
+const noEvalFile = "<empty>"
+
+// setEvalFile loads a trained network, or reverts to the hand-crafted
+// evaluation when the value is empty.
+//
+// A load failure reverts to the hand-crafted evaluation rather than leaving the
+// engine with whatever was there before. UCI gives an engine no way to refuse
+// an option, so the alternative is playing on with an evaluation the operator
+// believes they replaced — and a network silently not in use is exactly the
+// thing a strength test cannot detect. The reason goes to the GUI as an info
+// string, which is the one channel that reaches a human here.
+func (e *Engine) setEvalFile(path string) {
+	e.stopSearch()
+
+	path = strings.TrimSpace(path)
+	if path == "" || path == noEvalFile {
+		e.searcher.SetEvaluator(eval.NewHCE())
+		e.evalFile = ""
+		e.sendf("info string using the hand-crafted evaluation")
+		return
+	}
+
+	evaluator, err := nnue.Load(path)
+	if err != nil {
+		e.searcher.SetEvaluator(eval.NewHCE())
+		e.evalFile = ""
+		e.sendf("info string EvalFile %s could not be loaded (%v); using the hand-crafted evaluation", path, err)
+		return
+	}
+
+	e.searcher.SetEvaluator(evaluator)
+	e.evalFile = path
+	e.sendf("info string using network %s", path)
+}
+
+// evaluationName describes the evaluation in use, for the "eval" command.
+func (e *Engine) evaluationName() string {
+	if e.evalFile == "" {
+		return "hand-crafted"
+	}
+	return "network " + e.evalFile
 }
 
 // setPosition handles "position [startpos | fen <fen>] [moves <m>...]".

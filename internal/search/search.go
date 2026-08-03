@@ -137,6 +137,23 @@ const MaxThreads = 256
 // which is why UCI only allows it between games.
 func (s *Searcher) SetHashSize(megabytes int) { s.tt = NewTT(megabytes) }
 
+// SetEvaluator swaps the evaluation, which is how a trained network replaces
+// the hand-crafted one without the search knowing the difference.
+//
+// It must not be called while a search is running: the search threads read the
+// evaluator without synchronization, on the hot path where a mutex would cost
+// more than the evaluation itself. The table is also stale afterwards, holding
+// scores the old evaluation produced, so it is cleared rather than left to
+// blend two evaluations together.
+func (s *Searcher) SetEvaluator(e eval.Evaluator) {
+	s.evaluator = e
+	s.Clear()
+}
+
+// Evaluator returns the evaluation in use, so that a caller reporting a static
+// score reports the one the search would actually see.
+func (s *Searcher) Evaluator() eval.Evaluator { return s.evaluator }
+
 // Clear empties the transposition table, for "ucinewgame".
 func (s *Searcher) Clear() { s.tt.Clear() }
 
