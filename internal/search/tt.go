@@ -92,11 +92,6 @@ func (e *entry) write(key, data uint64) {
 	e.data.Store(data)
 }
 
-func (e *entry) clear() {
-	e.keyx.Store(0)
-	e.data.Store(0)
-}
-
 // bucketSize is how many entries share a bucket. Four 16-byte entries fill one
 // 64-byte cache line, so a probe touches exactly one line.
 const bucketSize = 4
@@ -132,12 +127,22 @@ func NewTT(megabytes int) *TT {
 }
 
 // Clear empties the table.
+//
+// It replaces the backing array rather than walking it. The result is the same
+// — every entry reads as a miss — but the work is a single allocation of
+// already-zero pages instead of two atomic stores per entry, of which a
+// default-sized table has several million. That difference is invisible in
+// ordinary play and very visible under the race detector, which instruments
+// every one of those stores.
+//
+// Like SetHashSize, which has always replaced the table this way, this must not
+// run while a search is in flight: the search threads read the table without
+// synchronization, and swapping it underneath them is a data race. The
+// requirement is that no search is running, which is weaker than a game
+// boundary — SetEvaluator clears mid-game when a network is loaded — so every
+// caller stops the search first rather than relying on where it sits in a game.
 func (t *TT) Clear() {
-	for i := range t.buckets {
-		for j := range t.buckets[i] {
-			t.buckets[i][j].clear()
-		}
-	}
+	t.buckets = make([]bucket, len(t.buckets))
 	t.gen.Store(0)
 }
 

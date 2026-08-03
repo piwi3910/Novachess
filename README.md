@@ -6,9 +6,10 @@ self-play training pipeline designed to run distributed across a cluster.
 ## Status
 
 Under construction. The engine plays: it is a working UCI engine with a Lichess
-bot, and the self-play half of the training loop generates data. What remains is
-the network that data is meant to train, and the services that run the loop
-unattended.
+bot, the self-play half of the training loop generates data, and the network
+that data trains runs behind the same interface as the hand-crafted evaluation.
+What remains is the trainer that turns one into the other, and the services that
+run the loop unattended.
 
 | Component | State |
 |---|---|
@@ -22,7 +23,7 @@ unattended.
 | UCI protocol and engine binary | done |
 | Lichess bot client | done |
 | Training data format and self-play generation | done |
-| Evaluation, NNUE | not started |
+| Evaluation, NNUE | network, inference and accumulator done; trainer not started |
 | Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
@@ -63,9 +64,14 @@ analysis, where reproducibility does not matter, should use every core.
 **Evaluation.** A hand-crafted evaluation first, so the engine plays early and
 can generate the initial self-play data. It is tapered between middlegame and
 endgame by material phase, which is what lets the king want the corner while
-queens are on and the centre once they are gone. NNUE replaces it behind the
-same interface once the training pipeline works, in the Stockfish lineage
-rather than the AlphaZero one — it runs well on CPU and needs no GPU.
+queens are on and the centre once they are gone.
+
+NNUE replaces it behind the same interface, in the Stockfish lineage rather than
+the AlphaZero one — it runs well on CPU and needs no GPU. The network is a
+768->256x2->1 perspective net: one input per colour, piece type and square,
+accumulated separately from each side's point of view, with the output layer
+reading the side to move's half first. See [Trained evaluation](#trained-evaluation)
+for what that shape buys.
 
 **Learning.** Self-play generates positions, those positions train a network,
 the stronger network generates better positions, and the loop repeats. Each new
@@ -102,6 +108,7 @@ internal/search/        negamax, transposition table, time management
 internal/eval/          evaluation
 internal/uci/           UCI protocol
 internal/lichess/       Lichess Bot API client
+internal/nnue/          trained evaluation: network, accumulator, inference
 internal/train/         self-play generation, packed data format, optimizer
 
 internal/events/        message contracts shared by all services
@@ -222,6 +229,47 @@ depth 5 across every arrangement — 635 million leaf nodes, all exact — with 
 sampled depth-6 pass under `-perft-full`. The orthodox arrangement written in
 Shredder notation is separately required to reproduce the classical perft counts
 exactly, which pins the generalized code to ground truth everyone agrees on.
+
+## Trained evaluation
+
+The network is a perspective net, 768->256x2->1. Its input is one feature per
+colour, piece type and square; those features are accumulated into a hidden
+layer twice, once from each side's point of view, and the output layer reads the
+side to move's half first and the opponent's second. Weights are stored
+quantized as integers rather than floats, because the search cannot afford float
+maths per node and because integer arithmetic is bit-for-bit identical on every
+machine — which the pipeline requires, since a network that evaluated
+differently on two boards would make self-play irreproducible.
+
+Two properties follow from that shape, and both are load-bearing.
+
+**The evaluation is symmetric by construction.** Mirroring a position — swapping
+colours and flipping ranks — swaps the two accumulator halves and swaps the side
+to move, so the output layer sees the identical pair of inputs and returns the
+identical number. This holds for any weights whatsoever, trained or random,
+which makes it a test of the feature indexing rather than of the training. It is
+the check that catches a wrong rank flip or a missed colour swap, which is the
+mistake this architecture invites.
+
+**The accumulator is incremental.** A move changes a handful of features, so the
+hidden layer is updated by adding and subtracting a few rows instead of being
+recomputed — the entire reason the architecture is shaped this way, since the
+first layer is the expensive one and a search evaluates millions of positions
+that differ from their parent by one piece. The incremental result is required
+to equal a full recomputation exactly; a drift there would have no symptom
+except bad play.
+
+The evaluator holds no mutable state, because the search shares one across every
+lazy SMP thread. An accumulator hanging off it would be written by all of them
+at once, which is a data race and would surface only as evaluations that are
+wrong when threads happen to overlap. Making the accumulator persist across plies
+means keeping one per ply and updating it in step with make and unmake, which is
+a change to the search rather than to the network.
+
+A network is loaded with the `EvalFile` UCI option, and unset by setting it
+empty. A load failure falls back to the hand-crafted evaluation and says so:
+UCI gives an engine no way to refuse an option, and a network silently not in
+use is invisible to a strength test.
 
 ## Training data
 

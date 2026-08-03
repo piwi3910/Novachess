@@ -448,3 +448,47 @@ func BenchmarkSearchStartPosition(b *testing.B) {
 		s.Search(context.Background(), p, Limits{Depth: 8}, nil)
 	}
 }
+
+// TestTTClearEmptiesTheTable covers the invariant Clear promises: after it,
+// every entry reads as a miss. Clear replaces the backing array rather than
+// walking it, so this is what confirms a fresh array is equivalent to erased
+// entries rather than merely cheaper to produce.
+func TestTTClearEmptiesTheTable(t *testing.T) {
+	tt := NewTT(1)
+
+	const stored = 500
+	for i := 0; i < stored; i++ {
+		// Keys spread across the table so they land in different buckets.
+		tt.Store(uint64(i)*0x9E3779B97F4A7C15, chess.NewMove(chess.E2, chess.E4), 42, 10, 8, 0, BoundExact)
+	}
+
+	found := 0
+	for i := 0; i < stored; i++ {
+		if _, _, hit, _ := tt.Probe(uint64(i)*0x9E3779B97F4A7C15, 8, 0, -eval.Infinite, eval.Infinite); hit {
+			found++
+		}
+	}
+	if found == 0 {
+		t.Fatal("stored 500 entries and probed none back; the test proves nothing")
+	}
+	if tt.Hashfull() == 0 {
+		t.Error("table reports empty after storing entries")
+	}
+
+	tt.Clear()
+
+	for i := 0; i < stored; i++ {
+		if _, _, hit, _ := tt.Probe(uint64(i)*0x9E3779B97F4A7C15, 8, 0, -eval.Infinite, eval.Infinite); hit {
+			t.Fatalf("entry %d survived Clear", i)
+		}
+	}
+	if got := tt.Hashfull(); got != 0 {
+		t.Errorf("Hashfull = %d after Clear, want 0", got)
+	}
+
+	// The table must still be usable afterwards, not merely empty.
+	tt.Store(99, chess.NewMove(chess.G1, chess.F3), 7, 3, 5, 0, BoundExact)
+	if _, _, hit, _ := tt.Probe(99, 5, 0, -eval.Infinite, eval.Infinite); !hit {
+		t.Error("table does not accept entries after Clear")
+	}
+}

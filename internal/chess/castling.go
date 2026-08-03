@@ -54,6 +54,22 @@ func colorRights(c Color) CastlingRights {
 	return BlackKingSide | BlackQueenSide
 }
 
+// CastlingDestinations returns the squares the king and rook finish on for a
+// castling move. Both are fixed in Chess960 exactly as in classical chess,
+// however far the pieces have to travel to reach them.
+//
+// Callers need this because a castling Move stores the rook's square as its
+// destination rather than the king's, so neither final square can be read off
+// the move. Anything that has to mirror the board change — an incremental
+// evaluation accumulator, most obviously — needs all four squares.
+//
+// kingSide is the direction of the castle, which for a move m is m.To() >
+// m.From().
+func CastlingDestinations(c Color, kingSide bool) (kingTo, rookTo Square) {
+	idx := castlingIndex(c, kingSide)
+	return castlingKingTo(idx), castlingRookTo(idx)
+}
+
 // castlingKingTo returns the square the king finishes on. These are fixed in
 // Chess960 exactly as in classical chess.
 func castlingKingTo(idx int) Square {

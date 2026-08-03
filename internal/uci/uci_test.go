@@ -3,11 +3,16 @@ package uci
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/piwi3910/novachess/internal/chess"
+	"github.com/piwi3910/novachess/internal/nnue"
 )
 
 // driver runs an engine over a pipe, the way a GUI does, and collects output
@@ -484,4 +489,113 @@ type limitsView struct {
 	WhiteInc, BlackInc   time.Duration
 	MovesToGo            int
 	Infinite             bool
+}
+
+// TestEvalFileLoadsANetwork checks the option that swaps the hand-crafted
+// evaluation for a trained one, and that "eval" then reports through the
+// evaluation the search actually uses rather than a hardcoded one.
+func TestEvalFileLoadsANetwork(t *testing.T) {
+	// A network with a single non-zero output bias evaluates every position as
+	// the same number, which makes it obvious whether it is in use.
+	net := nnue.NewZero()
+	net.OutputBias = 7 * nnue.QA * nnue.QB / nnue.Scale
+
+	path := filepath.Join(t.TempDir(), "test.nnue")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := net.WriteTo(f); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d := newDriver(t)
+	defer d.close()
+
+	d.send("setoption name EvalFile value " + path)
+	if got := d.expect("info string using network", 2*time.Second); !strings.Contains(got, path) {
+		t.Errorf("load message %q does not name the file", got)
+	}
+
+	// What the engine reports must be what this network actually computes, not
+	// merely a different number from the hand-crafted one — that would pass
+	// just as well if the wrong network were loaded.
+	reference, err := nnue.NewEvaluator(net)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := reference.Evaluate(chess.NewPosition())
+
+	d.send("position startpos")
+	d.send("eval")
+	got := d.expect("static evaluation", 2*time.Second)
+	if !strings.Contains(got, "network") {
+		t.Errorf("eval reported %q, want it to say a network is in use", got)
+	}
+	if !strings.Contains(got, strconv.Itoa(want)) {
+		t.Errorf("eval reported %q, want the network's own score of %d", got, want)
+	}
+
+	// The engine must still play with it.
+	d.send("go depth 3")
+	d.expect("bestmove", 15*time.Second)
+
+	// Unsetting reverts to the hand-crafted evaluation.
+	d.send("setoption name EvalFile value <empty>")
+	d.expect("info string using the hand-crafted", 2*time.Second)
+	d.send("eval")
+	if got := d.expect("static evaluation", 2*time.Second); !strings.Contains(got, "hand-crafted") {
+		t.Errorf("eval reported %q after unsetting, want the hand-crafted evaluation", got)
+	}
+}
+
+// TestEvalFileFailureFallsBackAudibly is the case that matters most. UCI gives
+// an engine no way to refuse an option, so a network that fails to load must
+// not leave the engine playing on while the operator believes it was replaced —
+// a network silently not in use is invisible to a strength test.
+func TestEvalFileFailureFallsBackAudibly(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.nnue")
+
+	junk := filepath.Join(t.TempDir(), "junk.nnue")
+	if err := os.WriteFile(junk, []byte("this is not a network"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"no such file", missing},
+		{"not a network", junk},
+	}
+
+	// Subtests rather than a bare loop, so that the deferred close still runs
+	// when an expectation times out: expect reports failures with Fatalf, which
+	// would otherwise abandon a running engine for every later case to compete
+	// with.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newDriver(t)
+			defer d.close()
+
+			d.send("setoption name EvalFile value " + tc.path)
+			got := d.expect("info string EvalFile", 2*time.Second)
+			if !strings.Contains(got, "hand-crafted") {
+				t.Errorf("failure message %q does not say what the engine fell back to", got)
+			}
+
+			// It must still play rather than being left in a broken state.
+			d.send("position startpos")
+			d.send("go depth 3")
+			d.expect("bestmove", 15*time.Second)
+
+			d.send("eval")
+			if e := d.expect("static evaluation", 2*time.Second); !strings.Contains(e, "hand-crafted") {
+				t.Errorf("after a failed load, eval reported %q", e)
+			}
+		})
+	}
 }
