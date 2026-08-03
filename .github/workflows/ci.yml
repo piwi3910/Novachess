@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          go-version: "stable"
 
       - name: Check formatting
         run: |
@@ -42,7 +42,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          go-version: "stable"
 
       # The deep node counts are the real correctness gate for move generation.
       # They are too slow for every local `go test` run but cheap enough to run
@@ -59,7 +59,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          go-version: "stable"
 
       # The self-play workers run on arm64. Building for it here catches any
       # accidental amd64-only dependency at the point it is introduced rather

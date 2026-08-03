@@ -194,15 +194,15 @@ exactly, which pins the generalized code to ground truth everyone agrees on.
 
 ## Building
 
-Requires Go 1.26 or later.
+Requires Go 1.26.5 or later, the current stable release. CI tracks `stable`,
+so it follows new releases as they land rather than pinning to a version that
+goes quietly out of date.
 
-The floor is 1.26 rather than something older because that is where `simd`
-and `simd/archsimd` land in the standard library. Nothing uses them yet — the
-engine is scalar Go throughout — but NNUE inference is the one place where
-hand-vectorized code will eventually pay for itself, and it is cheaper to
-require the toolchain now than to raise the floor once there are workers
-deployed across the cluster. See the note on SIMD under Design for the caveats:
-`archsimd` is amd64-only and sits behind `GOEXPERIMENT=simd`.
+1.26 is also where `simd` and `simd/archsimd` enter the standard library.
+Nothing uses them yet — the engine is scalar Go throughout — but NNUE inference
+is the one place hand-vectorized code will eventually pay for itself. See the
+note on SIMD under Design for the caveats: `archsimd` is amd64-only and sits
+behind `GOEXPERIMENT=simd`.
 
 ```
 go build ./...
