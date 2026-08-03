@@ -1,0 +1,105 @@
+# The trainer and the gatekeeper run once per generation.
+#
+# They are suspended CronJobs rather than Deployments so that `kubectl create
+# job --from=` can start one on demand with the spec already in the cluster. A
+# completed run is a fact, not something to keep alive: restarting a finished
+# training run would train the same network again.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: novachess-trainer
+  namespace: novachess
+spec:
+  # Started by hand, or by whatever eventually automates the hand-off. Never on
+  # a timer: training before a generation's data is complete would fit a
+  # network to a fraction of it.
+  schedule: "0 0 31 2 *"
+  suspend: true
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: trainer
+              image: novachess:dev
+              command:
+                - /usr/local/bin/trainer
+                - -out
+                - /data/networks/gen0.nnue
+                - -epochs
+                - "10"
+                - -batch
+                - "1024"
+                - -lr
+                - "0.001"
+              args: ["/data/gen0/"]
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: 2Gi
+                limits:
+                  memory: 8Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: novachess-data
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: novachess-gatekeeper
+  namespace: novachess
+spec:
+  schedule: "0 0 31 2 *"
+  suspend: true
+  jobTemplate:
+    spec:
+      # No retries. The exit status is the decision, and a rejection is a
+      # correct outcome rather than a failure to retry — rerunning until it
+      # passed would defeat the entire point of the gate.
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: gatekeeper
+              image: novachess:dev
+              command:
+                - /usr/local/bin/gatekeeper
+                - -candidate
+                - /data/networks/gen0.nnue
+                # No -incumbent: generation zero is matched against the
+                # hand-crafted evaluation, which is what it has to beat to be
+                # worth using at all.
+                - -games
+                - "2000"
+                - -nodes
+                - "20000"
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+              resources:
+                requests:
+                  cpu: "4"
+                  memory: 1Gi
+                limits:
+                  memory: 2Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: novachess-data

@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: novachess
+
+resources:
+  - namespace.yaml
+  - storage.yaml
+  - nats.yaml
+  - worker.yaml
+  - coordinator.yaml
+  - jobs.yaml
+
+# Point this at your registry once the image is pushed.
+images:
+  - name: novachess
+    newName: novachess
+    newTag: dev

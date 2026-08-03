@@ -1,0 +1,67 @@
+# The coordinator issues work and assembles datasets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: novachess-coordinator
+  namespace: novachess
+  labels:
+    app: novachess-coordinator
+spec:
+  # Exactly one, and Recreate rather than RollingUpdate. Two coordinators
+  # issuing units for the same generation would each count half the batches
+  # coming back, and neither would ever reach its target — a deadlock with no
+  # error anywhere.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: novachess-coordinator
+  template:
+    metadata:
+      labels:
+        app: novachess-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: novachess:dev
+          command: ["/usr/local/bin/coordinator"]
+          env:
+            - name: NOVA_BUS_URLS
+              value: "nats://nova-nats:4222"
+            - name: NOVA_DATA_DIR
+              value: "/data"
+            - name: NOVA_GENERATION
+              value: "0"
+            - name: NOVA_POSITIONS
+              value: "1000000"
+            - name: NOVA_GAMES_PER_UNIT
+              value: "50"
+            - name: NOVA_NODES
+              value: "20000"
+            - name: NOVA_UNITS_IN_FLIGHT
+              value: "64"
+            - name: NOVA_SEED
+              value: "1"
+            # Empty bootstraps generation zero from the hand-crafted
+            # evaluation. Set to a promoted network for later generations.
+            - name: NOVA_NETWORK_URI
+              value: ""
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: novachess-data
