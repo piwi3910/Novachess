@@ -221,3 +221,34 @@ table.history th {
 .verdict.rejected {
   color: #e78a8a;
 }
+
+.notice-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #1c2e1f;
+  border: 1px solid #2e5b36;
+  color: #b6e8bf;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.notice-banner button {
+  background: transparent;
+  border: none;
+  color: #b6e8bf;
+  font-size: 1rem;
+  padding: 0 0.25rem;
+}
+
+.selfplay-status {
+  margin-left: 0.75rem;
+  font-size: 0.8rem;
+  font-weight: normal;
+  color: #8fa3b8;
+  border: 1px solid #2c3a4a;
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  vertical-align: middle;
+}

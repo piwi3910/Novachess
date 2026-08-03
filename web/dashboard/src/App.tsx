@@ -70,7 +70,13 @@ export default function App() {
     <div className="app">
       <h1>Novachess training dashboard</h1>
       <Boards boards={snapshot?.boards ?? []} />
-      {snapshot && <Generation generation={snapshot.generation} samples={samplesRef.current} />}
+      {snapshot && (
+        <Generation
+          generation={snapshot.generation}
+          selfplay={snapshot.selfplay}
+          samples={samplesRef.current}
+        />
+      )}
       <Training
         generation={snapshot?.generation.generation ?? 0}
         history={history}

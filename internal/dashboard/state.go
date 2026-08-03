@@ -14,6 +14,13 @@ import (
 // heartbeat every 15 seconds; three misses means the pod or the board is gone.
 const StaleAfter = 45 * time.Second
 
+// EvictAfter is how long a silent board stays visible before it is dropped
+// entirely. The gap between StaleAfter and EvictAfter is the alarm window: a
+// board that stopped heartbeating shows red long enough to be noticed, but a
+// pod replaced by a rollout or a scale-down does not haunt the page forever —
+// heartbeats are keyed by pod name, and every rollout mints new ones.
+const EvictAfter = 10 * time.Minute
+
 type Board struct {
 	WorkerID       string    `json:"worker_id"`
 	NodeName       string    `json:"node_name"`
@@ -94,12 +101,24 @@ func (s *State) Snapshot(now time.Time) Snapshot {
 	gen := s.progress
 	gen.Target = s.target
 	out := Snapshot{Generation: gen, Boards: []Board{}}
-	for _, b := range s.boards {
+	for id, b := range s.boards {
+		if now.Sub(b.LastSeen) > EvictAfter {
+			delete(s.boards, id)
+			continue
+		}
 		b.Stale = now.Sub(b.LastSeen) > StaleAfter
 		out.Boards = append(out.Boards, b)
 	}
 	sort.Slice(out.Boards, func(i, j int) bool { return out.Boards[i].WorkerID < out.Boards[j].WorkerID })
 	return out
+}
+
+// Touch notifies subscribers without changing any state. Control actions use
+// it so a scale change reaches open SSE streams immediately — with workers
+// paused there are no heartbeats, and without this nudge nothing else would
+// ever push a fresh frame.
+func (s *State) Touch() {
+	s.notify()
 }
 
 // Subscribe returns a channel that receives a tick whenever state changes,

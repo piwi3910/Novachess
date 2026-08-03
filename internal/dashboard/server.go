@@ -118,14 +118,16 @@ type selfplayInfo struct {
 	Coordinator any `json:"coordinator"`
 }
 
-func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
+// statePayload is the one shape of truth both GET /api/state and the SSE
+// state event serve. The selfplay counts ride along so a pause or resume is
+// visible on every open page, not only in the response to whoever clicked.
+func (s *Server) statePayload(ctx context.Context) any {
 	snap := s.state.Snapshot(time.Now())
 	out := struct {
 		Snapshot
 		Selfplay selfplayInfo `json:"selfplay"`
 	}{Snapshot: snap}
 
-	ctx := r.Context()
 	if n, err := s.cluster.Replicas(ctx, DeployWorkers); err != nil {
 		out.Selfplay.Workers = err.Error()
 	} else {
@@ -136,8 +138,11 @@ func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out.Selfplay.Coordinator = n
 	}
+	return out
+}
 
-	writeJSON(w, http.StatusOK, out)
+func (s *Server) getState(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.statePayload(r.Context()))
 }
 
 func (s *Server) getHistory(w http.ResponseWriter, r *http.Request) {
@@ -158,8 +163,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	logCh := s.trainLog.Subscribe()
 	defer s.trainLog.Unsubscribe(logCh)
 	send := func() {
-		snap := s.state.Snapshot(time.Now())
-		data, _ := json.Marshal(snap)
+		data, _ := json.Marshal(s.statePayload(r.Context()))
 		w.Write([]byte("event: state\ndata: "))
 		w.Write(data)
 		w.Write([]byte("\n\n"))
@@ -287,6 +291,9 @@ func (s *Server) selfplay(w http.ResponseWriter, r *http.Request) {
 		writeControlError(w, err)
 		return
 	}
+	// The scale changed but nothing that feeds State did; nudge the SSE
+	// streams so every open page sees the new counts within a second.
+	s.state.Touch()
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 
@@ -334,6 +341,8 @@ func (s *Server) advance(w http.ResponseWriter, r *http.Request) {
 		writeControlError(w, err)
 		return
 	}
+	// Advancing scales the coordinator back up; push the change to open pages.
+	s.state.Touch()
 	writeJSON(w, http.StatusOK, map[string]any{})
 }
 

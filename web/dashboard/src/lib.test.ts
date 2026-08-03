@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eta, parseEpochLine, rate } from "./lib";
+import { eta, parseEpochLine, rate, selfplayStatus } from "./lib";
 
 describe("eta", () => {
   it("is null when done or rate unknown", () => {
@@ -27,5 +27,23 @@ describe("parseEpochLine", () => {
   });
   it("rejects other lines", () => {
     expect(parseEpochLine("final training loss 0.01, validation loss 0.02")).toBeNull();
+  });
+});
+
+describe("selfplayStatus", () => {
+  it("is empty until counts arrive", () => {
+    expect(selfplayStatus(undefined, undefined)).toBe("");
+  });
+  it("names the paused state plainly", () => {
+    expect(selfplayStatus(0, 0)).toBe("self-play paused");
+  });
+  it("shows workers and a parked coordinator", () => {
+    expect(selfplayStatus(8, 0)).toBe("8 workers · coordinator parked");
+  });
+  it("shows workers and a running coordinator", () => {
+    expect(selfplayStatus(8, 1)).toBe("8 workers · coordinator running");
+  });
+  it("surfaces error strings verbatim", () => {
+    expect(selfplayStatus("boom", 0)).toBe("boom");
   });
 });
