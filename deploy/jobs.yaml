@@ -41,9 +41,12 @@ spec:
               resources:
                 requests:
                   cpu: "4"
-                  memory: 2Gi
+                  memory: 4Gi
                 limits:
-                  memory: 8Gi
+                  # The trainer loads every sample into memory. Five million
+                  # positions fit well inside this; the old 8Gi was sized for
+                  # one million and would OOM first and explain nothing.
+                  memory: 16Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
