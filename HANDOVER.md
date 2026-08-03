@@ -203,11 +203,24 @@ kubectl -n novachess get pvc novachess-data
 # STATUS must be Bound, ACCESS MODES must be RWX
 ```
 
-Then prove it is really shared — this is worth the two minutes:
+Then prove it is really shared — this is worth the two minutes. You cannot
+`kubectl exec ... ls` into the pipeline pods: the image is distroless/static
+and has no shell or coreutils. Mount the PVC from a throwaway pod instead:
 ```bash
-kubectl -n novachess exec deploy/novachess-coordinator -- ls /data
-# after workers have run, this must show gen0/ with files from multiple workers
+kubectl -n novachess run vol-check --restart=Never --image=busybox --overrides='
+{"spec":{"containers":[{"name":"vol-check","image":"busybox",
+  "command":["sh","-c","ls /data/gen0"],
+  "volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+ "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"novachess-data"}}],
+ "restartPolicy":"Never"}}'
+kubectl -n novachess logs vol-check   # once Completed
+kubectl -n novachess delete pod vol-check
+# after workers have run, this must show batches from multiple workers
 ```
+The coordinator also proves sharing continuously: it checksum-verifies every
+batch (`store.Verify`) from a different node than the one that wrote it, so
+`counted a batch` lines naming several distinct workers are themselves
+evidence the volume is shared.
 
 **NATS up:**
 ```bash
@@ -353,8 +366,17 @@ rejected or empty stayed "in flight" forever. And a work unit whose games all
 ended inside the random opening produced zero positions, and the worker
 returned without announcing anything at all.
 
-**Check:** compare `issued` in the coordinator's log against batches counted.
-If `issued` is frozen while workers are idle, this is back.
+**Check:** the coordinator does not log issuance, so watch the work queue
+itself. On `curl -s localhost:8222/jsz?streams=true` (port-forward 8222 from
+`svc/nova-nats`), `NOVA_WORK`'s `last_seq` is the number of units ever issued
+and `messages` is the queue depth, which the coordinator keeps topped up to
+`NOVA_UNITS_IN_FLIGHT`. Healthy: `last_seq` climbing and depth steady at the
+ceiling. This failure mode: depth draining toward zero and `last_seq` frozen
+while workers sit idle and the counted total is below target. The unit IDs in
+`counted a batch` lines rising monotonically is the same signal from the log
+side. A unit that comes back empty is also logged now
+(`a unit produced no positions`), so the original silent variant of this
+stall would leave a trace.
 
 ### The trainer sees a fraction of the data
 
@@ -601,8 +623,8 @@ kubectl -n novachess run nats-box --rm -it --image=natsio/nats-box -- \
 kubectl -n novachess port-forward svc/nova-nats 8222:8222
 curl -s localhost:8222/jsz | jq
 
-# What is on the volume
-kubectl -n novachess exec deploy/novachess-coordinator -- ls -R /data
+# What is on the volume — the images are distroless, so exec has no `ls`;
+# mount the PVC from a throwaway busybox pod instead (see section 4.3)
 
 # Run a generation's trainer and gate
 kubectl -n novachess create job --from=cronjob/novachess-trainer   train-gen0
