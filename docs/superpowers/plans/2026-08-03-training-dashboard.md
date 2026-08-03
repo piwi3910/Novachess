@@ -1677,7 +1677,9 @@ vitest.
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
 
----### Task 10: Dockerfile and CI
+---
+
+### Task 10: Dockerfile and CI
 
 **Files:**
 - Modify: `Dockerfile`
