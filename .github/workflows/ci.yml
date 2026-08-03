@@ -102,3 +102,29 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/novachess:${{ steps.version.outputs.version }}
+
+  frontend:
+    name: Dashboard frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/dashboard/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: web/dashboard
+
+      - name: Test
+        run: npm test
+        working-directory: web/dashboard
+
+      # The build is the artifact the Go binary embeds; a frontend that
+      # tests green but does not build would still break the image job.
+      - name: Build
+        run: npm run build
+        working-directory: web/dashboard

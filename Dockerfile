@@ -7,6 +7,15 @@
 # Build for the cluster:
 #   docker buildx build --platform linux/arm64 -t novachess:dev --load .
 
+# The SPA builds first so the Go stage can embed it. package.json is copied
+# alone first for layer caching, same reasoning as go.mod below.
+FROM --platform=$BUILDPLATFORM node:22 AS web
+WORKDIR /web
+COPY web/dashboard/package.json web/dashboard/package-lock.json ./
+RUN npm ci
+COPY web/dashboard/ ./
+RUN npm run build
+
 # The build stage runs on the builder's native platform and cross-compiles via
 # TARGETARCH; without this an amd64 CI runner would emulate the arm64 compiler
 # under QEMU.
@@ -19,6 +28,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+
+COPY --from=web /web/dist/ web/dashboard/dist/
 
 ARG VERSION=dev
 ARG TARGETARCH
@@ -34,7 +45,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
 # Fail the build rather than the deployment if a binary is missing.
 RUN test -x /out/selfplay-worker && test -x /out/coordinator && \
     test -x /out/trainer && test -x /out/gatekeeper && \
-    test -x /out/novachess && test -x /out/novabot
+    test -x /out/novachess && test -x /out/novabot && test -x /out/dashboard
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
