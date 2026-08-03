@@ -437,3 +437,105 @@ func TestCoordinatorHonoursContextCancellation(t *testing.T) {
 		t.Error("the generation ignored a cancelled context")
 	}
 }
+
+// TestGenerationDoesNotStallOnRejectedBatches is the accounting bug this test
+// was written to catch.
+//
+// Outstanding work was computed as issued minus counted batches. A unit whose
+// batch fails verification is never counted, so it stayed "outstanding"
+// forever, and after UnitsInFlight such units the coordinator stopped issuing
+// work entirely. The generation would then hang with idle workers, no error
+// anywhere, and a target it could never reach.
+func TestGenerationDoesNotStallOnRejectedBatches(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+
+	units := collect(t, b, events.SubjectWorkAssign)
+
+	cfg := testConfig()
+	cfg.UnitsInFlight = 3
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.topUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	issuedFirst := len(units())
+
+	// More rejected batches than the in-flight limit, so a stall would be
+	// certain rather than possible.
+	for i := 0; i < cfg.UnitsInFlight+2; i++ {
+		batch := putBatch(t, s, fmt.Sprintf("g0-bad%d", i), 0, 100)
+		// Corrupt beyond repair: the artifact is gone.
+		if err := s.Delete(context.Background(), batch.ArtifactURI); err != nil {
+			t.Fatal(err)
+		}
+
+		env, err := bus.NewEnvelope(events.SubjectGamesProduced, "test", batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.handleBatch(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := c.topUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(units()); got <= issuedFirst {
+		t.Errorf("after %d rejected batches the coordinator issued no more work (%d units total); the generation would hang",
+			cfg.UnitsInFlight+2, got)
+	}
+}
+
+// TestGenerationDoesNotStallOnEmptyUnits covers the other way a unit finishes
+// without contributing. A unit whose games all ended in the random opening
+// produces no positions; if that left nothing on the bus, the coordinator would
+// wait for an announcement that never came.
+func TestGenerationDoesNotStallOnEmptyUnits(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+
+	units := collect(t, b, events.SubjectWorkAssign)
+
+	cfg := testConfig()
+	cfg.UnitsInFlight = 3
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.topUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	issuedFirst := len(units())
+
+	for i := 0; i < cfg.UnitsInFlight+2; i++ {
+		empty := events.GameBatch{
+			WorkUnitID: fmt.Sprintf("g0-empty%d", i),
+			WorkerID:   "worker-1",
+			Generation: 0,
+			Positions:  0,
+		}
+		env, err := bus.NewEnvelope(events.SubjectGamesProduced, "test", empty)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.handleBatch(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := c.topUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(units()); got <= issuedFirst {
+		t.Errorf("after %d empty units the coordinator issued no more work (%d units total)",
+			cfg.UnitsInFlight+2, got)
+	}
+}

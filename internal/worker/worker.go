@@ -163,18 +163,19 @@ func (w *Worker) handle(ctx context.Context, env events.Envelope) error {
 		}
 		return err
 	}
+	// A unit whose games all ended in the random opening is legal but useless.
+	// It is still announced, with no artifact and no positions: staying silent
+	// would leave the coordinator waiting for a report that never comes, and it
+	// counts outstanding work by what has reported back.
+	var artifact store.Artifact
 	if len(samples) == 0 {
-		// Legal but useless: a unit whose games all ended in the random
-		// opening. Acknowledged rather than retried, since replaying it would
-		// produce the same nothing.
 		log.Warn("produced no usable positions", "games", stats.Games)
-		return nil
-	}
-
-	artifact, err := w.storeBatch(ctx, unit, samples)
-	if err != nil {
-		log.Error("could not store the batch", "error", err)
-		return err
+	} else {
+		artifact, err = w.storeBatch(ctx, unit, samples)
+		if err != nil {
+			log.Error("could not store the batch", "error", err)
+			return err
+		}
 	}
 
 	// Announced only after the artifact is durably stored, and acknowledged by

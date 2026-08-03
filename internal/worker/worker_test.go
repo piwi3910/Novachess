@@ -423,3 +423,52 @@ func TestWorkerIsIdempotentAcrossRedelivery(t *testing.T) {
 		t.Errorf("a replayed unit produced %d then %d positions", first.Positions, second.Positions)
 	}
 }
+
+// TestWorkerAnnouncesEvenAnEmptyUnit covers the unit that produces nothing.
+//
+// Staying silent would be the obvious thing and is wrong: the coordinator
+// measures outstanding work by what has reported back, so a silent unit counts
+// as still in flight forever. Enough of them and the coordinator stops issuing
+// work and the generation hangs with idle workers.
+func TestWorkerAnnouncesEvenAnEmptyUnit(t *testing.T) {
+	b := bus.NewMemory("test")
+
+	w, err := New(testConfig(), b, testStore(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batches := collect(t, b, events.SubjectGamesProduced)
+
+	// Random plies deep enough that the opening finishes the game before the
+	// engine ever moves, so nothing usable is produced.
+	unit := testUnit()
+	unit.Games = 1
+	unit.RandomPlies = 400
+
+	env, err := bus.NewEnvelope(events.SubjectWorkAssign, "test", unit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.handle(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+
+	got := batches()
+	if len(got) != 1 {
+		t.Fatalf("%d announcements from a unit that produced nothing, want 1", len(got))
+	}
+
+	var batch events.GameBatch
+	if err := bus.Unmarshal(got[0], &batch); err != nil {
+		t.Fatal(err)
+	}
+	if batch.WorkUnitID != unit.ID {
+		t.Errorf("the announcement names unit %q, want %q", batch.WorkUnitID, unit.ID)
+	}
+	if batch.Positions != 0 {
+		t.Errorf("an empty unit reported %d positions", batch.Positions)
+	}
+	if batch.ArtifactURI != "" {
+		t.Errorf("an empty unit named an artifact %q", batch.ArtifactURI)
+	}
+}

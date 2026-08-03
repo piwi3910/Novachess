@@ -107,11 +107,16 @@ type Coordinator struct {
 	log   *slog.Logger
 
 	mu sync.Mutex
-	// seen deduplicates batches by work unit. Delivery is at-least-once, so a
-	// redelivered unit produces a second announcement of data already counted;
-	// counting it twice would end a generation early with less data than it
-	// asked for.
-	seen       map[string]bool
+	// resolved is every unit that has reported back, whatever came of it.
+	//
+	// It serves two purposes, and conflating them was a bug. It deduplicates:
+	// delivery is at-least-once, so a redelivered unit announces data already
+	// counted, and counting it twice would end a generation early with less
+	// data than it asked for. And it is what "outstanding" is measured against
+	// — a unit whose batch failed verification, or that produced no positions,
+	// has finished even though it contributed nothing, and treating it as still
+	// in flight would eventually stop the coordinator issuing work at all.
+	resolved   map[string]bool
 	artifacts  []string
 	positions  int
 	games      int
@@ -138,7 +143,7 @@ func New(cfg Config, b bus.Bus, s store.Store, log *slog.Logger) (*Coordinator, 
 		bus:        b,
 		store:      s,
 		log:        log,
-		seen:       make(map[string]bool),
+		resolved:   make(map[string]bool),
 		generation: cfg.Generation,
 		done:       make(chan struct{}),
 	}, nil
@@ -211,12 +216,25 @@ func (c *Coordinator) handleBatch(ctx context.Context, env events.Envelope) erro
 		c.mu.Unlock()
 		return nil
 	}
-	if c.seen[batch.WorkUnitID] {
+	if c.resolved[batch.WorkUnitID] {
 		c.mu.Unlock()
 		c.log.Debug("ignoring a duplicate batch", "unit", batch.WorkUnitID)
 		return nil
 	}
+	// Marked before it is validated, not after. The unit has reported back
+	// whatever happens next, and every path below leaves it finished — so
+	// recording it here is what keeps the outstanding count honest and stops a
+	// duplicate racing through the verification below.
+	c.resolved[batch.WorkUnitID] = true
 	c.mu.Unlock()
+
+	// A unit whose games all ended in the random opening produces nothing.
+	// It announces itself anyway, so that the coordinator learns it is done
+	// rather than waiting for an artifact that was never written.
+	if batch.Positions == 0 || batch.ArtifactURI == "" {
+		c.log.Warn("a unit produced no positions", "unit", batch.WorkUnitID, "worker", batch.WorkerID)
+		return nil
+	}
 
 	// Confirmed before it is counted. A worker announces a batch it believes it
 	// stored; if the artifact is missing or corrupt, counting it would build a
@@ -230,18 +248,12 @@ func (c *Coordinator) handleBatch(ctx context.Context, env events.Envelope) erro
 		c.log.Error("rejecting a batch that does not verify",
 			"error", err, "unit", batch.WorkUnitID, "worker", batch.WorkerID)
 		// Not retried: the artifact will not become correct on redelivery. The
-		// unit's positions are simply missing, and the generation issues more
-		// work to make up for them.
+		// unit's positions are simply missing, and because it is already marked
+		// resolved the generation issues more work to make up for them.
 		return nil
 	}
 
 	c.mu.Lock()
-	if c.seen[batch.WorkUnitID] {
-		// Another delivery won the race while this one was verifying.
-		c.mu.Unlock()
-		return nil
-	}
-	c.seen[batch.WorkUnitID] = true
 	c.artifacts = append(c.artifacts, batch.ArtifactURI)
 	c.positions += batch.Positions
 	c.games += batch.Games
@@ -266,8 +278,13 @@ func (c *Coordinator) handleBatch(ctx context.Context, env events.Envelope) erro
 
 // topUp issues units until enough are outstanding.
 func (c *Coordinator) topUp(ctx context.Context) error {
+	// Measured against every unit that has reported back, not against the ones
+	// that contributed data. A unit that failed verification or produced no
+	// positions is finished; counting it as still in flight would shrink the
+	// queue with every such unit until the coordinator stopped issuing work and
+	// the generation hung with idle workers.
 	c.mu.Lock()
-	outstanding := c.issued - len(c.artifacts)
+	outstanding := c.issued - len(c.resolved)
 	needed := c.cfg.UnitsInFlight - outstanding
 	c.mu.Unlock()
 
