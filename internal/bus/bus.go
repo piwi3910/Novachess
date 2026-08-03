@@ -75,19 +75,40 @@ type Config struct {
 	// connection back to it.
 	ClientName string
 
-	// Stream is the JetStream stream backing durable subjects. Empty selects
-	// core NATS, which is fire-and-forget with no redelivery — acceptable for
-	// heartbeats, never for work assignment.
+	// Stream is the name prefix for the JetStream streams. Two are created from
+	// it, one for work and one for facts; see the note on DurableSubjects for
+	// why they cannot be the same stream. Empty selects a default prefix.
+	//
+	// Whether a given subject is stored is decided per subject rather than by
+	// this field: work and decisions are durable, heartbeats are not. A single
+	// switch would force the pipeline to choose between losing work
+	// assignments and archiving heartbeats forever.
 	Stream string
 
-	// Durable names the consumer so that its position in the stream survives
-	// restarts. Without it, a restarting service either replays everything or
-	// resumes from the present, and neither is what a work queue wants.
+	// Durable names this service's consumer for fan-out subscriptions, so its
+	// position survives a restart and it does not miss, say, a promotion that
+	// happened while it was being rescheduled. It must be unique per service:
+	// two services sharing a name would share a consumer and each see only
+	// half the messages.
+	//
+	// Empty means an ephemeral consumer, which starts from the present. That is
+	// the right choice for a service that only cares what happens from now on.
+	//
+	// Queue subscriptions ignore this and derive their durable name from the
+	// group, since sharing is the entire point there.
 	Durable string
 
-	// MaxInFlight bounds unacknowledged messages per consumer. For self-play
-	// workers this should be 1: a worker holding several unstarted units while
-	// idle peers wait is exactly the imbalance the queue group exists to
-	// prevent.
+	// MaxInFlight bounds unacknowledged messages.
+	//
+	// This is a ceiling per consumer, and the members of a queue group share
+	// one — so for work assignment it bounds the whole cluster, not each
+	// worker. Setting it to the number of units a worker should hold at once
+	// throttles every worker to that number between them, and adding boards
+	// then changes nothing. Leave it at the default unless the cluster is
+	// larger than that default allows.
+	//
+	// The "one unit at a time per worker" property is not this field's job: it
+	// comes from how many messages a subscriber buffers, which the
+	// implementation fixes at one.
 	MaxInFlight int
 }
