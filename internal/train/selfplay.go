@@ -152,10 +152,8 @@ func (g *Generator) playGame(ctx context.Context, openingFEN string, randomPlies
 			return nil, stats, ctx.Err()
 		}
 
-		var reason chess.TerminationReason
-		outcome, reason = pos.Outcome()
+		outcome, _ = pos.Outcome()
 		if outcome != chess.Ongoing {
-			_ = reason
 			break
 		}
 
