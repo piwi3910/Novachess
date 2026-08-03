@@ -490,6 +490,43 @@ func TestResultWeightBlends(t *testing.T) {
 	}
 }
 
+// TestProgressReportsEveryEpoch checks that the live callback and the
+// after-the-fact Result agree, since a dashboard tailing Progress must see
+// exactly the numbers Result.EpochLoss would report once training is done.
+func TestProgressReportsEveryEpoch(t *testing.T) {
+	var calls []float64
+	var epochs []int
+	p := testParams()
+	p.Epochs = 3
+	p.Progress = func(epoch int, loss float64) {
+		epochs = append(epochs, epoch)
+		calls = append(calls, loss)
+	}
+
+	tr, err := NewTrainer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stats, err := tr.Train(context.Background(), materialCorpus(t, 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(calls) != p.Epochs {
+		t.Fatalf("Progress called %d times, want %d", len(calls), p.Epochs)
+	}
+	for i, e := range epochs {
+		if e != i+1 {
+			t.Fatalf("epoch %d reported as %d; want 1-based ascending", i+1, e)
+		}
+	}
+	for i := range calls {
+		if calls[i] != stats.EpochLoss[i] {
+			t.Fatalf("epoch %d: Progress loss %v != Result.EpochLoss %v", i+1, calls[i], stats.EpochLoss[i])
+		}
+	}
+}
+
 func TestTrainRejectsBadParams(t *testing.T) {
 	cases := []struct {
 		name   string
