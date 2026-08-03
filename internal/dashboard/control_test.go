@@ -328,6 +328,37 @@ func TestAdvanceAfterPromotion(t *testing.T) {
 	}
 }
 
+// TestStartAllowedAfterAdvance pins the advance-then-start seam: after
+// AdvanceGeneration moves the coordinator on to generation 1, StartSelfplay
+// must succeed even though gen 0 has a dataset record in history. A wrong
+// CoordinatorGeneration implementation that reads the newest dataset record
+// out of history - rather than the coordinator Deployment's actual
+// NOVA_GENERATION env var - would still see gen 0's dataset record, refuse
+// every subsequent Start, and stall the self-play loop after the very first
+// generation.
+func TestStartAllowedAfterAdvance(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	writeNetworkFile(t, dataDir, 0)
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	if err := h.Append(Record{Type: "dataset", Generation: 0, Positions: 1000000, At: time.Now()}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	if err := h.Append(Record{Type: "gate", Generation: 0, Promoted: true, At: time.Now()}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	ct := NewController(fc, h, dataDir, 4)
+
+	if err := ct.AdvanceGeneration(ctx, 1); err != nil {
+		t.Fatalf("AdvanceGeneration: %v", err)
+	}
+
+	if err := ct.StartSelfplay(ctx, false); err != nil {
+		t.Fatalf("StartSelfplay after advance: %v", err)
+	}
+}
+
 // TestAdvanceRefusesWithMissingNetworkFile checks Finding 5: a promotion
 // record without the corresponding network file on disk is a refusal (409),
 // the same as an outright missing promotion, not an unrelated 500 - both are
