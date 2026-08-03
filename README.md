@@ -5,11 +5,11 @@ self-play training pipeline designed to run distributed across a cluster.
 
 ## Status
 
-Under construction. The engine plays: it is a working UCI engine with a Lichess
-bot, the self-play half of the training loop generates data, and the network
-that data trains runs behind the same interface as the hand-crafted evaluation.
-What remains is the trainer that turns one into the other, and the services that
-run the loop unattended.
+Under construction. The learning loop closes: self-play generates labelled
+positions, the trainer fits a network to them, and the engine plays with that
+network through the same interface as the hand-crafted evaluation. What remains
+is the services that run the loop unattended, and the gatekeeper that decides
+whether each new network is actually an improvement.
 
 | Component | State |
 |---|---|
@@ -23,8 +23,9 @@ run the loop unattended.
 | UCI protocol and engine binary | done |
 | Lichess bot client | done |
 | Training data format and self-play generation | done |
-| Evaluation, NNUE | network, inference and accumulator done; trainer not started |
-| Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
+| Evaluation, NNUE | network, inference and accumulator done |
+| Trainer | done |
+| Pipeline services (coordinator, worker, gatekeeper) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
 GUI or match runner can load.
@@ -100,7 +101,7 @@ cmd/novachess/          UCI engine binary
 cmd/novabot/            Lichess bot binary
 cmd/coordinator/        work distribution and dataset assembly
 cmd/selfplay-worker/    game generation
-cmd/trainer/            network training
+cmd/trainer/            network training (implemented)
 cmd/gatekeeper/         SPRT gating
 
 internal/chess/         board, move generation, Zobrist, perft
@@ -303,6 +304,43 @@ node given a time limit would search less and play different moves; and it runs
 one thread, because lazy SMP works by letting threads race and is
 non-deterministic by construction. Scale with more workers, not more threads per
 worker.
+
+## Training
+
+The trainer reads packed self-play files and writes a network:
+
+```
+go build ./cmd/trainer
+./trainer -out gen1.nnue data/*.novadata
+./novachess
+> setoption name EvalFile value gen1.nnue
+```
+
+It trains in float32 and quantizes at the end. The engine needs integer weights
+— its arithmetic has to be identical on every machine — but gradients through
+integers are meaningless, so the two representations are kept apart and the
+conversion is **measured rather than assumed**. Every run reports how far the
+quantized network drifted from the model that was trained, against that
+network's own output range, and how many weights did not fit the integer range
+at all. A clipped weight means the saved network is not the model whose loss was
+printed, which is a distinction nothing downstream could otherwise recover.
+
+Each sample carries two labels and the trainer blends them, controlled by
+`-result-weight`. The search score is precise but only as good as the evaluation
+that produced it, so training on it alone teaches the network to imitate its
+predecessor and the loop stops improving. The game result is ground truth but
+very noisy, since one position in a lost game may well have been winning.
+Neither extreme is what you want.
+
+The run is deterministic: the same inputs with the same seed produce
+byte-identical weights, so a generation can be reproduced or audited rather than
+merely trusted. Input files are sorted before reading, because a shell glob's
+order depends on the locale and would otherwise silently change the result.
+
+The reported losses are diagnostics, not a verdict. A network can improve its
+loss against the training objective and still play worse — which is exactly what
+the gatekeeper's SPRT match exists to catch, and why nothing here decides
+whether a network is promoted.
 
 ## Running
 
