@@ -29,7 +29,7 @@ spec:
                 - -out
                 - /data/networks/gen0.nnue
                 - -epochs
-                - "10"
+                - "15"
                 - -batch
                 - "1024"
                 - -lr
