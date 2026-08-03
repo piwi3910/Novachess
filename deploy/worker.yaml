@@ -7,12 +7,14 @@ metadata:
   labels:
     app: novachess-worker
 spec:
-  # Five per board: each board has 8 cores and a worker searches on exactly
-  # one, so this leaves 3 for k3s, Longhorn and the control plane. Scale this
-  # rather than giving a worker more search threads: a fixed-node search is
-  # deterministic at one thread and not at two, and the pipeline replays work
-  # units on different boards expecting identical games.
-  replicas: 40
+  # Four per board: each board has 8 cores, a worker searches on exactly one,
+  # and the other four are not idle — Longhorn replication, NATS, k3s and the
+  # rest of the cluster live there too. Five per board OOM-killed workers and
+  # knocked the storage share-manager over. Scale this rather than giving a
+  # worker more search threads: a fixed-node search is deterministic at one
+  # thread and not at two, and the pipeline replays work units on different
+  # boards expecting identical games.
+  replicas: 32
   selector:
     matchLabels:
       app: novachess-worker
@@ -44,6 +46,11 @@ spec:
               value: "/data"
             - name: NOVA_HASH_MB
               value: "64"
+            # Keep the Go heap comfortably inside the cgroup limit: the GC's
+            # default policy lets a spiky heap overshoot into an OOM kill,
+            # and a killed worker strands its unit for the full ack wait.
+            - name: GOMEMLIMIT
+              value: "800MiB"
             - name: NOVA_WORKER_ID
               valueFrom:
                 fieldRef:
@@ -60,9 +67,9 @@ spec:
               # One core, because one worker searches on one thread. Raising
               # this does not make it faster.
               cpu: "1"
-              memory: 256Mi
+              memory: 384Mi
             limits:
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
