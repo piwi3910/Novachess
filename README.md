@@ -18,8 +18,8 @@ evaluation, UCI and the Lichess client are not yet implemented.
 | Search (alpha-beta, TT, quiescence) | done |
 | Evaluation, hand-crafted | done |
 | UCI protocol and engine binary | done |
+| Lichess bot client | done |
 | Evaluation, NNUE | not started |
-| Lichess bot client | not started |
 | Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
@@ -88,7 +88,7 @@ around the engine, not pieces of it.
 
 ```
 cmd/novachess/          UCI engine binary
-cmd/novabot/            Lichess bot client
+cmd/novabot/            Lichess bot binary
 cmd/coordinator/        work distribution and dataset assembly
 cmd/selfplay-worker/    game generation
 cmd/trainer/            network training
@@ -241,6 +241,27 @@ bestmove e2e4 ponder e7e5
 Beyond the protocol there are three commands that make manual testing bearable:
 `d` prints the board, `eval` prints the static evaluation, and `perft <depth>`
 runs a divide from the current position.
+
+### Playing on Lichess
+
+`cmd/novabot` plays games on Lichess directly, without the Python bridge. It
+needs a token with the `bot:play` scope from an account that has been upgraded
+to a bot account — an upgrade that only works while the account has never
+played a rated game, and cannot be undone.
+
+```
+export LICHESS_TOKEN=lip_xxxxxxxxxxxx
+go build ./cmd/novabot
+./novabot -upgrade          # once, irreversibly
+./novabot
+```
+
+It accepts standard and Chess960 challenges, rated or casual, and declines
+anything else with a reason rather than leaving the challenger waiting —
+including variants whose rules the engine does not implement, where accepting
+would mean playing illegal moves rather than merely playing badly. Each game
+runs in its own goroutine with its own searcher, so a search never blocks the
+bot from noticing events in its other games.
 
 ## Building
 
