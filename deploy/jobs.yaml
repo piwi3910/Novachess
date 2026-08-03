@@ -24,6 +24,12 @@ spec:
           containers:
             - name: trainer
               image: novachess:dev
+              env:
+                # Let the garbage collector fight for the last gigabytes
+                # before the cgroup kill does: fifteen-million-sample runs
+                # live near the ceiling.
+                - name: GOMEMLIMIT
+                  value: "22GiB"
               command:
                 - /usr/local/bin/trainer
                 - -out
@@ -43,10 +49,10 @@ spec:
                   cpu: "4"
                   memory: 4Gi
                 limits:
-                  # The trainer loads every sample into memory. Five million
-                  # positions fit well inside this; the old 8Gi was sized for
-                  # one million and would OOM first and explain nothing.
-                  memory: 16Gi
+                  # The trainer loads every sample into memory and tonight's
+                  # datasets reached fifteen million positions. Sized against
+                  # the 30Gi boards with self-play parked during training.
+                  memory: 24Gi
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
