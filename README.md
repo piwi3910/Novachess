@@ -27,6 +27,7 @@ the loop unattended across a cluster.
 | Trainer | done |
 | Gatekeeper (SPRT match gating) | done |
 | Artifact storage | done |
+| Message bus, NATS with JetStream | done |
 | Pipeline services (coordinator, worker) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
@@ -117,7 +118,7 @@ internal/nnue/          trained evaluation: network, accumulator, inference
 internal/train/         self-play generation, packed data format, optimizer
 
 internal/events/        message contracts shared by all services
-internal/bus/           message bus abstraction and NATS implementation
+internal/bus/           message bus abstraction, in-memory and NATS
 ```
 
 ## Move generation
@@ -391,6 +392,41 @@ Matches search by nodes and run one thread, for the same reasons self-play does:
 a match decided partly by which process got more CPU measures nothing, and a
 gating decision that cannot be reproduced cannot be audited when a promotion
 later looks like a mistake.
+
+## Message bus
+
+Services coordinate over NATS. `internal/bus` defines a narrow interface —
+publish, subscribe, queue-subscribe — with two implementations: an in-process
+one for tests, and NATS with JetStream for the cluster. Both build the envelope
+through the same code, so the bytes a test validates are the bytes production
+carries.
+
+**Two streams, because work and facts are not the same kind of message.** Work
+assignment uses work-queue retention: a unit is played once and removed on
+acknowledgement, since keeping every completed unit would fill the disk with
+finished work. Batches produced, datasets assembled and networks promoted are
+kept by age instead.
+
+That split is forced rather than stylistic. A work-queue stream permits only
+*one* consumer per subject, and a promoted network has to reach every worker and
+the bot at once. Putting both kinds on one work-queue stream fails outright, and
+that is how it was found.
+
+Heartbeats travel on core NATS with no stream at all. They are worth nothing a
+second later, and storing them would fill a stream with the one message type
+nobody ever replays.
+
+**Publishing a durable message waits for the server's acknowledgement**, so it
+is on disk before `Publish` returns. A self-play worker depends on that: it must
+know its batch announcement survived before it acknowledges the unit that
+produced it, or a broker restart in between loses the games entirely.
+
+The tests run against a real broker, started in process. That is the point —
+everything this implementation could get wrong lives in the parts a mock would
+have to reimplement: whether a queue group really gives a unit to one member,
+whether a rejected message really comes back, whether a durable consumer really
+resumes where it left off. A fake answering those questions would be asserting
+its own behaviour.
 
 ## Artifact storage
 

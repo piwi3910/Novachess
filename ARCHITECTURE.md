@@ -69,6 +69,22 @@ JetStream supplies the delivery semantics the pipeline actually depends on:
 At-least-once means duplicate batches are possible, so every artifact carries
 the work unit ID that produced it and the coordinator deduplicates on it.
 
+**Two streams, because work and facts are not the same kind of message.** Work
+assignment uses work-queue retention: a unit is played once and removed on
+acknowledgement, since keeping every completed unit would fill the disk with
+finished work. Everything else — batches produced, datasets ready, networks
+promoted or rejected — is kept by age instead.
+
+That split is forced rather than stylistic. A work-queue stream permits only one
+consumer per subject, and a promoted network has to reach every worker *and* the
+bot simultaneously. Putting both kinds on one work-queue stream fails outright
+with `filtered consumer not unique on workqueue stream`, which is how this was
+found.
+
+Heartbeats are on core NATS with no stream at all. They are worth nothing a
+second later, and storing them would fill a stream with the one message type
+nobody ever replays.
+
 ## Control plane and data plane are separate
 
 **Bus messages carry references, never bulk data.**
