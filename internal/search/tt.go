@@ -137,8 +137,10 @@ func NewTT(megabytes int) *TT {
 //
 // Like SetHashSize, which has always replaced the table this way, this must not
 // run while a search is in flight: the search threads read the table without
-// synchronization, and swapping it underneath them is a data race. UCI only
-// reaches here between games.
+// synchronization, and swapping it underneath them is a data race. The
+// requirement is that no search is running, which is weaker than a game
+// boundary — SetEvaluator clears mid-game when a network is loaded — so every
+// caller stops the search first rather than relying on where it sits in a game.
 func (t *TT) Clear() {
 	t.buckets = make([]bucket, len(t.buckets))
 	t.gen.Store(0)

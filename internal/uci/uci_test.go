@@ -564,24 +564,38 @@ func TestEvalFileFailureFallsBackAudibly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{missing, junk} {
-		d := newDriver(t)
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"no such file", missing},
+		{"not a network", junk},
+	}
 
-		d.send("setoption name EvalFile value " + path)
-		got := d.expect("info string EvalFile", 2*time.Second)
-		if !strings.Contains(got, "hand-crafted") {
-			t.Errorf("failure message %q does not say what the engine fell back to", got)
-		}
+	// Subtests rather than a bare loop, so that the deferred close still runs
+	// when an expectation times out: expect reports failures with Fatalf, which
+	// would otherwise abandon a running engine for every later case to compete
+	// with.
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newDriver(t)
+			defer d.close()
 
-		// It must still play rather than being left in a broken state.
-		d.send("position startpos")
-		d.send("go depth 3")
-		d.expect("bestmove", 15*time.Second)
+			d.send("setoption name EvalFile value " + tc.path)
+			got := d.expect("info string EvalFile", 2*time.Second)
+			if !strings.Contains(got, "hand-crafted") {
+				t.Errorf("failure message %q does not say what the engine fell back to", got)
+			}
 
-		d.send("eval")
-		if e := d.expect("static evaluation", 2*time.Second); !strings.Contains(e, "hand-crafted") {
-			t.Errorf("after a failed load, eval reported %q", e)
-		}
-		d.close()
+			// It must still play rather than being left in a broken state.
+			d.send("position startpos")
+			d.send("go depth 3")
+			d.expect("bestmove", 15*time.Second)
+
+			d.send("eval")
+			if e := d.expect("static evaluation", 2*time.Second); !strings.Contains(e, "hand-crafted") {
+				t.Errorf("after a failed load, eval reported %q", e)
+			}
+		})
 	}
 }
