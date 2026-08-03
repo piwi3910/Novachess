@@ -7,7 +7,10 @@
 # Build for the cluster:
 #   docker buildx build --platform linux/arm64 -t novachess:dev --load .
 
-FROM golang:1.26 AS build
+# The build stage runs on the builder's native platform and cross-compiles via
+# TARGETARCH; without this an amd64 CI runner would emulate the arm64 compiler
+# under QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 
 WORKDIR /src
 

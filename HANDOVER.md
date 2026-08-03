@@ -129,49 +129,48 @@ If your storage class has a different name, change `storageClassName` in
 ### 3.2 A registry the cluster can pull from
 
 The manifests reference the image `novachess:dev`, which does not exist
-anywhere. You must build and push. See section 4.1.
+anywhere. CI builds and pushes the real image on every push — see section 4.1.
+The cluster must be able to pull from `ghcr.io`; if the package is private,
+the `novachess` namespace needs an image pull secret.
 
 ### 3.3 arm64
 
-The boards are Orange Pi, so `linux/arm64`. The image must be built for that
-platform. CI already cross-compiles on every push (the "Cross-compile for the
-cluster" job), so a broken arm64 build will not reach you — but the *image*
-still has to be built for the right architecture, and `docker build` on an
-x86 laptop will silently produce an amd64 image that fails with `exec format
-error` on the boards.
+The boards are Orange Pi, so `linux/arm64`. CI cross-compiles on every push
+(the "Cross-compile for the cluster" job) and the "Build and push image" job
+builds the image itself for `linux/arm64`, so an amd64-only image cannot reach
+you through CI. If you ever build locally instead, use `docker buildx build
+--platform linux/arm64` — a plain `docker build` on an x86 or Apple-silicon
+laptop will silently produce an image for the wrong platform that fails with
+`exec format error` on the boards.
 
 ---
 
 ## 4. Deploying
 
-### 4.1 Build and push the image
+### 4.1 The image
 
 One image contains all six binaries; each Deployment picks one with `command`.
 They share the whole engine, so building six images would multiply layers,
 pushes and version skew for nothing.
 
-```bash
-docker buildx build \
-  --platform linux/arm64 \
-  --build-arg VERSION="$(git describe --always --dirty)" \
-  -t YOUR_REGISTRY/novachess:v1 \
-  --push .
-```
-
-`VERSION` is stamped into every batch the workers produce, so a dataset can
-later be traced back to the build that generated it. Use a real version, not
-`dev`.
+CI's "Build and push image" job builds `linux/arm64` and pushes
+`ghcr.io/piwi3910/novachess:<version>` on every push, where `<version>` is
+`git describe --always --dirty` for the built commit. `VERSION` is stamped
+into every batch the workers produce, so a dataset can later be traced back
+to the build that generated it — which is also why the tag is the version
+rather than `latest` or `dev`.
 
 The Dockerfile asserts at build time that all six binaries exist, so a missing
 binary fails the build rather than the deployment.
 
-Then point the manifests at it in [kustomization.yaml](deploy/kustomization.yaml):
+Point the manifests at the pushed tag in
+[kustomization.yaml](deploy/kustomization.yaml):
 
 ```yaml
 images:
   - name: novachess
-    newName: YOUR_REGISTRY/novachess
-    newTag: v1
+    newName: ghcr.io/piwi3910/novachess
+    newTag: <version>
 ```
 
 ### 4.2 Apply
@@ -529,13 +528,7 @@ deployment. Note the constraint: the search shares one evaluator across lazy
 SMP threads, and the evaluator is currently stateless for that reason. Making
 the accumulator incremental means giving each search thread its own.
 
-### 7. No image build in CI
-
-CI runs tests, perft and a cross-compile, but does not build or push the
-container image. Every deploy is a manual `docker buildx` from a laptop, which
-means the image can drift from what was tested.
-
-### 8. Secrets and the Lichess bot
+### 7. Secrets and the Lichess bot
 
 `cmd/novabot` is not deployed by these manifests at all. When it is, it needs
 `LICHESS_TOKEN` as a Kubernetes Secret — it is supplied by env var and must
@@ -543,7 +536,7 @@ never be committed. Note also that `novabot -upgrade` irreversibly converts a
 Lichess account to a BOT account and requires an account that has never played
 a rated game.
 
-### 9. Backup
+### 8. Backup
 
 The PVC holds every generation of training data and every network. Longhorn
 supports recurring snapshots; none are configured. A million positions is
