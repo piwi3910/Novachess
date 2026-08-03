@@ -24,6 +24,12 @@ type fakeCluster struct {
 	jobCommands  [][]string
 	jobArgs      [][]string
 	jobCronNames []string
+
+	// calls is a single ordered log across every method, so tests can assert
+	// relative order between calls that land in different fields above (e.g.
+	// SetCoordinatorGeneration must happen before the coordinator is scaled
+	// up, or it restarts into the wrong generation).
+	calls []string
 }
 
 func newFakeCluster() *fakeCluster {
@@ -40,12 +46,14 @@ func (f *fakeCluster) Replicas(_ context.Context, d string) (int32, error) {
 func (f *fakeCluster) Scale(_ context.Context, d string, n int32) error {
 	f.scales[d] = append(f.scales[d], n)
 	f.replicas[d] = n
+	f.calls = append(f.calls, fmt.Sprintf("scale:%s:%d", d, n))
 	return nil
 }
 
 func (f *fakeCluster) SetCoordinatorGeneration(_ context.Context, generation int, networkURI string) error {
 	f.coordGen = append(f.coordGen, generation)
 	f.coordURI = append(f.coordURI, networkURI)
+	f.calls = append(f.calls, fmt.Sprintf("setgen:%d", generation))
 	return nil
 }
 
@@ -150,6 +158,28 @@ func TestAdvanceAfterPromotion(t *testing.T) {
 	}
 	if got := fc.replicas[DeployCoordinator]; got != 1 {
 		t.Fatalf("expected coordinator scaled to 1, got %d", got)
+	}
+
+	// Order matters: a coordinator scaled up before its env is patched would
+	// restart into the wrong generation, so setgen must precede the scale.
+	setgenIdx, scaleIdx := -1, -1
+	for i, c := range fc.calls {
+		switch c {
+		case "setgen:1":
+			if setgenIdx == -1 {
+				setgenIdx = i
+			}
+		case fmt.Sprintf("scale:%s:1", DeployCoordinator):
+			if scaleIdx == -1 {
+				scaleIdx = i
+			}
+		}
+	}
+	if setgenIdx == -1 || scaleIdx == -1 {
+		t.Fatalf("expected both setgen:1 and scale:%s:1 in call log, got %v", DeployCoordinator, fc.calls)
+	}
+	if setgenIdx > scaleIdx {
+		t.Fatalf("expected SetCoordinatorGeneration before coordinator scale-up, got call order %v", fc.calls)
 	}
 }
 
