@@ -7,11 +7,12 @@ metadata:
   labels:
     app: novachess-worker
 spec:
-  # One per board to start. Scale this rather than giving a worker more search
-  # threads: a fixed-node search is deterministic at one thread and not at two,
-  # and the pipeline replays work units on different boards expecting identical
-  # games.
-  replicas: 8
+  # Five per board: each board has 8 cores and a worker searches on exactly
+  # one, so this leaves 3 for k3s, Longhorn and the control plane. Scale this
+  # rather than giving a worker more search threads: a fixed-node search is
+  # deterministic at one thread and not at two, and the pipeline replays work
+  # units on different boards expecting identical games.
+  replicas: 40
   selector:
     matchLabels:
       app: novachess-worker
