@@ -15,11 +15,15 @@ evaluation, UCI and the Lichess client are not yet implemented.
 | Chess960 | done, verified on all 960 arrangements |
 | Game termination rules (draws, mate, stalemate, dead positions) | done |
 | Pipeline message contracts and bus abstraction | done |
-| Search (alpha-beta, TT, quiescence) | not started |
-| Evaluation (hand-crafted, then NNUE) | not started |
-| UCI protocol | not started |
+| Search (alpha-beta, TT, quiescence) | done |
+| Evaluation, hand-crafted | done |
+| UCI protocol and engine binary | done |
+| Evaluation, NNUE | not started |
 | Lichess bot client | not started |
 | Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
+
+The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
+GUI or match runner can load.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the service topology and the
 reasoning behind where the boundary between engine and services falls.
@@ -27,14 +31,38 @@ reasoning behind where the boundary between engine and services falls.
 ## Design
 
 **Search.** Classical alpha-beta rather than MCTS: negamax with iterative
-deepening, aspiration windows, a Zobrist transposition table, quiescence search
-with SEE, null-move pruning, late move reductions, and killer/history move
-ordering. Lazy SMP for multithreading.
+deepening, aspiration windows, a Zobrist transposition table, quiescence search,
+null-move pruning, reverse futility, late move reductions, and killer/history
+move ordering. Lazy SMP for multithreading, via the `Threads` option.
+
+Threads share nothing but the transposition table, which uses lockless hashing:
+each entry is one packed word stored alongside that word XOR-ed with the
+position key, so a reader that catches a writer mid-update sees a mismatch and
+treats the entry as a miss. Locking a structure probed millions of times a
+second would defeat the point of threading, and leaving it unsynchronized is a
+data race — undefined behaviour in Go, not merely untidy.
+
+Two properties are treated as requirements rather than nice-to-haves. The
+principal variation must be legal move by move, which is what catches
+corruption in the PV table, the transposition table or make/unmake — all of
+which otherwise surface only as mysteriously bad play. And a fixed-depth or
+fixed-node search must be deterministic **at one thread**, because the
+distributed pipeline replays work units on different nodes and the training
+data cannot be allowed to depend on which machine ran them.
+
+That second property is why `Threads` defaults to 1 and why the thread count is
+a policy decision rather than a performance knob. Lazy SMP works precisely by
+letting threads race on the shared table, so more than one thread is
+non-deterministic by construction. Self-play must run one thread per worker —
+scale by running more workers, not more threads per worker. Match play and
+analysis, where reproducibility does not matter, should use every core.
 
 **Evaluation.** A hand-crafted evaluation first, so the engine plays early and
-can generate the initial self-play data. NNUE replaces it behind the same
-interface once the training pipeline works, in the Stockfish lineage rather than
-the AlphaZero one — it runs well on CPU and needs no GPU.
+can generate the initial self-play data. It is tapered between middlegame and
+endgame by material phase, which is what lets the king want the corner while
+queens are on and the centre once they are gone. NNUE replaces it behind the
+same interface once the training pipeline works, in the Stockfish lineage
+rather than the AlphaZero one — it runs well on CPU and needs no GPU.
 
 **Learning.** Self-play generates positions, those positions train a network,
 the stronger network generates better positions, and the loop repeats. Each new
@@ -191,6 +219,28 @@ depth 5 across every arrangement — 635 million leaf nodes, all exact — with 
 sampled depth-6 pass under `-perft-full`. The orthodox arrangement written in
 Shredder notation is separately required to reproduce the classical perft counts
 exactly, which pins the generalized code to ground truth everyone agrees on.
+
+## Running
+
+```
+go build ./cmd/novachess
+./novachess
+```
+
+It speaks UCI on stdin and stdout, so any UCI GUI or match runner can load it.
+Driven by hand it looks like this:
+
+```
+position startpos
+go depth 12
+info depth 12 seldepth 31 score cp 24 nodes 2551987 nps 813404 time 3137 ...
+  pv e2e4 e7e5 g1f3 g8f6 b1c3 b8c6 d2d4 e5d4 f3d4 c6d4 d1d4 f8d6
+bestmove e2e4 ponder e7e5
+```
+
+Beyond the protocol there are three commands that make manual testing bearable:
+`d` prints the board, `eval` prints the static evaluation, and `perft <depth>`
+runs a divide from the current position.
 
 ## Building
 

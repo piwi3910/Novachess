@@ -358,6 +358,73 @@ func (p *Position) UnmakeMove() {
 	p.key = u.key
 }
 
+// MakeNullMove passes the turn without moving a piece.
+//
+// This is not a legal chess move. It exists for null-move pruning, where the
+// search asks "if I did nothing at all, could my opponent still not hurt me?"
+// and prunes the subtree when the answer is no. It must never be played in a
+// position where the side to move is in check, since the resulting position
+// would have a capturable king, and the search must not use it in endgames
+// where zugzwang makes doing nothing genuinely better than moving.
+//
+// Must be paired with UnmakeNullMove, not UnmakeMove.
+func (p *Position) MakeNullMove() {
+	p.history = append(p.history, undo{
+		move:     MoveNone,
+		captured: NoPiece,
+		castling: p.castling,
+		epSquare: p.epSquare,
+		halfmove: p.halfmove,
+		key:      p.key,
+	})
+
+	if p.epSquare != NoSquare {
+		p.key ^= zobristEPFile[p.epSquare.File()]
+		p.epSquare = NoSquare
+	}
+
+	// Reset the halfmove clock so repetition detection cannot look back past
+	// this point. Positions on either side of a null move are not reachable
+	// from one another by legal play, so treating them as repetitions would
+	// invent draws that do not exist.
+	p.halfmove = 0
+
+	if p.side == Black {
+		p.fullmove++
+	}
+	p.side = p.side.Opposite()
+	p.key ^= zobristSide
+}
+
+// UnmakeNullMove reverts MakeNullMove.
+func (p *Position) UnmakeNullMove() {
+	n := len(p.history) - 1
+	if n < 0 {
+		panic("chess: UnmakeNullMove with empty history")
+	}
+	u := p.history[n]
+	if !u.move.IsNone() {
+		panic("chess: UnmakeNullMove on a real move")
+	}
+	p.history = p.history[:n]
+
+	p.side = p.side.Opposite()
+	if p.side == Black {
+		p.fullmove--
+	}
+	p.castling = u.castling
+	p.epSquare = u.epSquare
+	p.halfmove = u.halfmove
+	p.key = u.key
+}
+
+// IsCapture reports whether a move captures an enemy piece, including en
+// passant. Move ordering leans on this heavily, so it avoids generating
+// anything.
+func (p *Position) IsCapture(m Move) bool {
+	return m.Kind() == KindEnPassant || (m.Kind() != KindCastling && p.board[m.To()] != NoPiece)
+}
+
 // epCaptureAvailable reports whether the given side has a pawn that can legally
 // capture en passant onto epSq.
 //
