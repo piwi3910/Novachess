@@ -9,7 +9,10 @@ metadata:
 # Everything the dashboard may do, and nothing else. Notably absent: any
 # write on pods, any access outside the namespace, and any verb on the
 # worker Deployment beyond scaling. The coordinator env patch is what
-# advances a generation.
+# advances a generation. Scaling itself goes through the plain Deployment
+# object (Get/Update on spec.replicas, in internal/dashboard/cluster.go),
+# not the deployments/scale subresource, so that subresource is not granted
+# here.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -25,9 +28,6 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "update", "patch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
-    verbs: ["get", "update", "patch"]
   - apiGroups: ["batch"]
     resources: ["cronjobs"]
     verbs: ["get"]
@@ -57,7 +57,13 @@ metadata:
   labels:
     app: novachess-dashboard
 spec:
+  # Exactly one, and Recreate rather than RollingUpdate. Two dashboards would
+  # both append to history.jsonl and both hold a bus consumer identity at
+  # once - the same reasoning as the coordinator, just for a file and a
+  # consumer name instead of self-play batches.
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: novachess-dashboard
@@ -80,6 +86,8 @@ spec:
               value: "novachess"
             - name: NOVA_WORKER_REPLICAS
               value: "8"
+            - name: NOVA_POSITIONS
+              value: "1000000"
           ports:
             - containerPort: 8080
               name: http

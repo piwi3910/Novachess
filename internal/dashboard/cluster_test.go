@@ -64,21 +64,40 @@ func TestSetCoordinatorGenerationPatchesOnlyItsEnv(t *testing.T) {
 	}
 }
 
-func TestCreateJobFromCronCopiesTemplateAndOverridesCommand(t *testing.T) {
-	cron := &batchv1.CronJob{
+func trainerCron() *batchv1.CronJob {
+	return &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{Name: CronTrainer, Namespace: "novachess"},
 		Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{
 			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				RestartPolicy: corev1.RestartPolicyNever,
-				Containers:    []corev1.Container{{Name: "trainer", Image: "novachess:dev", Command: []string{"/usr/local/bin/trainer", "-out", "/data/networks/gen0.nnue"}, Args: []string{"/data/gen0/"}}},
+				Containers: []corev1.Container{{
+					Name: "trainer", Image: "novachess:dev",
+					Command: []string{"/usr/local/bin/trainer", "-out", "/data/networks/gen0.nnue", "-epochs", "10"},
+					Args:    []string{"/data/gen0/"},
+				}},
 			}}},
 		}},
 	}
-	cs := fake.NewClientset(cron)
+}
+
+// TestCreateJobFromCronRewritesElementsInPlace checks the core of Finding
+// 3's fix: the launched Job keeps the template's tuned flags (-epochs here)
+// verbatim, and only the elements the rewrite function actually changes
+// (the two generation-numbered paths) come out different.
+func TestCreateJobFromCronRewritesElementsInPlace(t *testing.T) {
+	cs := fake.NewClientset(trainerCron())
 	c := newClusterWith(cs, "novachess")
-	err := c.CreateJobFromCron(context.Background(), CronTrainer, "train-gen1",
-		[]string{"/usr/local/bin/trainer", "-out", "/data/networks/gen1.nnue"}, []string{"/data/gen1/"})
-	if err != nil {
+	rewrite := func(elem string) string {
+		switch elem {
+		case "/data/networks/gen0.nnue":
+			return "/data/networks/gen1.nnue"
+		case "/data/gen0/":
+			return "/data/gen1/"
+		default:
+			return elem
+		}
+	}
+	if err := c.CreateJobFromCron(context.Background(), CronTrainer, "train-gen1", rewrite); err != nil {
 		t.Fatal(err)
 	}
 	j, err := cs.BatchV1().Jobs("novachess").Get(context.Background(), "train-gen1", metav1.GetOptions{})
@@ -86,11 +105,68 @@ func TestCreateJobFromCronCopiesTemplateAndOverridesCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := j.Spec.Template.Spec.Containers[0]
-	if got.Command[2] != "/data/networks/gen1.nnue" || got.Args[0] != "/data/gen1/" {
-		t.Fatalf("template not overridden for the generation: %v %v", got.Command, got.Args)
+	wantCommand := []string{"/usr/local/bin/trainer", "-out", "/data/networks/gen1.nnue", "-epochs", "10"}
+	if len(got.Command) != len(wantCommand) {
+		t.Fatalf("Command = %v, want %v", got.Command, wantCommand)
+	}
+	for i, want := range wantCommand {
+		if got.Command[i] != want {
+			t.Fatalf("Command = %v, want %v", got.Command, wantCommand)
+		}
+	}
+	if got.Args[0] != "/data/gen1/" {
+		t.Fatalf("Args = %v, want [/data/gen1/]", got.Args)
 	}
 	if got.Image != "novachess:dev" {
 		t.Fatal("image must come from the cron template, not be invented")
+	}
+}
+
+// TestCreateJobFromCronNilRewriteLeavesTemplateUnchanged checks the
+// documented nil contract.
+func TestCreateJobFromCronNilRewriteLeavesTemplateUnchanged(t *testing.T) {
+	cs := fake.NewClientset(trainerCron())
+	c := newClusterWith(cs, "novachess")
+	if err := c.CreateJobFromCron(context.Background(), CronTrainer, "train-gen0", nil); err != nil {
+		t.Fatal(err)
+	}
+	j, err := cs.BatchV1().Jobs("novachess").Get(context.Background(), "train-gen0", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := j.Spec.Template.Spec.Containers[0]
+	want := []string{"/usr/local/bin/trainer", "-out", "/data/networks/gen0.nnue", "-epochs", "10"}
+	if len(got.Command) != len(want) {
+		t.Fatalf("Command = %v, want %v unchanged", got.Command, want)
+	}
+	for i, w := range want {
+		if got.Command[i] != w {
+			t.Fatalf("Command = %v, want %v unchanged", got.Command, want)
+		}
+	}
+}
+
+func TestRewriteElementsDropsEmptyAndExpandsSpaces(t *testing.T) {
+	tokens := []string{"-candidate", "gen0.nnue", "-drop-me", "-games", "2000"}
+	rewrite := func(elem string) string {
+		switch elem {
+		case "-drop-me":
+			return "" // removed entirely
+		case "gen0.nnue":
+			return "gen1.nnue -incumbent gen0.nnue" // expands into three tokens
+		default:
+			return elem
+		}
+	}
+	got := rewriteElements(tokens, rewrite)
+	want := []string{"-candidate", "gen1.nnue", "-incumbent", "gen0.nnue", "-games", "2000"}
+	if len(got) != len(want) {
+		t.Fatalf("rewriteElements = %v, want %v", got, want)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("rewriteElements = %v, want %v", got, want)
+		}
 	}
 }
 

@@ -9,10 +9,17 @@ import (
 	"github.com/piwi3910/novachess/internal/events"
 )
 
-// WatchEvents follows the durable event stream: batch production feeds the
+// WatchEvents follows the retained event stream: batch production feeds the
 // generation progress view, dataset announcements and network verdicts feed
-// the history. With a durable consumer name the broker replays the retained
-// window after a restart, so progress survives a dashboard reschedule.
+// the history. The bus subscribes with ReplayAll, so a fresh ephemeral
+// consumer replays everything the stream's 7-day window still holds on every
+// connection - including after a dashboard restart - rather than resuming
+// from an acked position the way a durable consumer would. Progress survives
+// a reschedule because it dedups by WorkUnitID as it replays; history
+// survives it because each stream-derived record is appended only if an
+// equivalent one is not already there (see History.AppendIfAbsent) - so
+// replaying the same window twice, whether from two restarts or from two
+// deliveries of one event, costs nothing.
 func WatchEvents(ctx context.Context, b bus.Bus, s *State, h *History) error {
 	var mu sync.Mutex
 	seen := make(map[string]struct{}) // WorkUnitID dedup: delivery is at-least-once
@@ -50,7 +57,10 @@ func WatchEvents(ctx context.Context, b bus.Bus, s *State, h *History) error {
 		if err := bus.Unmarshal(env, &ds); err != nil {
 			return err
 		}
-		return h.Append(Record{Type: "dataset", Generation: ds.Generation, Positions: ds.Positions, At: time.Now()})
+		return h.AppendIfAbsent(
+			Record{Type: "dataset", Generation: ds.Generation, Positions: ds.Positions, At: time.Now()},
+			func(r Record) bool { return r.Type == "dataset" && r.Generation == ds.Generation },
+		)
 	}); err != nil {
 		return err
 	}
@@ -64,7 +74,9 @@ func WatchEvents(ctx context.Context, b bus.Bus, s *State, h *History) error {
 			rec := Record{Type: "gate", Generation: v.Generation, Promoted: promoted,
 				Wins: v.Wins, Losses: v.Losses, Draws: v.Draws, EloDelta: v.EloDelta, LOS: v.LOS,
 				Reason: v.Reason, NetworkURI: v.ArtifactURI, At: time.Now()}
-			return h.Append(rec)
+			return h.AppendIfAbsent(rec, func(r Record) bool {
+				return r.Type == "gate" && r.Generation == v.Generation && r.NetworkURI == v.ArtifactURI
+			})
 		}
 	}
 	if _, err := b.Subscribe(ctx, events.SubjectNetPromoted, verdict(true)); err != nil {

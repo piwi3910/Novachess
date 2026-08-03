@@ -314,6 +314,60 @@ func TestNATSDurableConsumerResumes(t *testing.T) {
 	}
 }
 
+// TestNATSReplayAllRedeliversTheRetainedWindow is the property the dashboard
+// depends on: a fan-out subscriber whose state lives in memory only must be
+// able to rebuild it from the stream on every restart, not just from the
+// moment it reconnects. Contrast with TestNATSDurableConsumerResumes, which
+// checks the opposite guarantee for a service that wants to resume rather
+// than replay.
+func TestNATSReplayAllRedeliversTheRetainedWindow(t *testing.T) {
+	url := runBroker(t)
+	ctx := context.Background()
+
+	first, err := Connect(ctx, Config{URLs: []string{url}, ClientName: "dashboard-1", ReplayAll: true})
+	if err != nil {
+		t.Fatalf("connecting: %v", err)
+	}
+	t.Cleanup(func() { first.Close() })
+
+	var firstCount atomic.Int32
+	sub, err := first.Subscribe(ctx, events.SubjectNetPromoted, func(context.Context, events.Envelope) error {
+		firstCount.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := first.Publish(ctx, events.SubjectNetPromoted, events.NetworkVerdict{Generation: 1, Promoted: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first subscriber to see the event", func() bool { return firstCount.Load() == 1 })
+
+	// The service restarts: its subscription and connection go away, but the
+	// broker still retains the event.
+	sub.Close()
+	first.Close()
+
+	second, err := Connect(ctx, Config{URLs: []string{url}, ClientName: "dashboard-2", ReplayAll: true})
+	if err != nil {
+		t.Fatalf("reconnecting: %v", err)
+	}
+	t.Cleanup(func() { second.Close() })
+
+	var secondCount atomic.Int32
+	sub2, err := second.Subscribe(ctx, events.SubjectNetPromoted, func(context.Context, events.Envelope) error {
+		secondCount.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub2.Close()
+
+	waitFor(t, "the restarted subscriber to replay the retained event", func() bool { return secondCount.Load() == 1 })
+}
+
 // TestNATSHeartbeatsAreNotStored checks the routing decision. Heartbeats are
 // worth nothing a second later, and storing them would fill the stream with
 // the one message type nobody ever replays.

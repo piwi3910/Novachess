@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -42,7 +43,14 @@ type Cluster interface {
 	Replicas(ctx context.Context, deployment string) (int32, error)
 	Scale(ctx context.Context, deployment string, replicas int32) error
 	SetCoordinatorGeneration(ctx context.Context, generation int, networkURI string) error
-	CreateJobFromCron(ctx context.Context, cronName, jobName string, command []string, args []string) error
+	// CreateJobFromCron launches a one-shot Job from the named suspended
+	// CronJob's template. rewrite, if non-nil, is applied to every element
+	// of the template's Command and Args in place - not a wholesale
+	// replacement - so tuned flags the template carries (-epochs, -games,
+	// and the like) survive untouched and only the elements a caller
+	// chooses to change (generation-numbered paths) are rewritten. See
+	// rewriteElements for how a rewrite can also remove or insert elements.
+	CreateJobFromCron(ctx context.Context, cronName, jobName string, rewrite func(element string) string) error
 	Job(ctx context.Context, name string) (JobState, error)
 	StreamJobLogs(ctx context.Context, jobName string) (io.ReadCloser, error)
 }
@@ -123,7 +131,7 @@ func (c *k8sCluster) SetCoordinatorGeneration(ctx context.Context, generation in
 	return err
 }
 
-func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName string, command, args []string) error {
+func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName string, rewrite func(string) string) error {
 	cron, err := c.cs.BatchV1().CronJobs(c.namespace).Get(ctx, cronName, metav1.GetOptions{})
 	if err != nil {
 		return err
@@ -132,12 +140,9 @@ func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName st
 	if len(spec.Template.Spec.Containers) != 1 {
 		return fmt.Errorf("dashboard: cron %s has %d containers, expected 1", cronName, len(spec.Template.Spec.Containers))
 	}
-	if command != nil {
-		spec.Template.Spec.Containers[0].Command = command
-	}
-	if args != nil {
-		spec.Template.Spec.Containers[0].Args = args
-	}
+	cont := &spec.Template.Spec.Containers[0]
+	cont.Command = rewriteElements(cont.Command, rewrite)
+	cont.Args = rewriteElements(cont.Args, rewrite)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: jobName, Namespace: c.namespace,
 			Labels: map[string]string{"app": "novachess-" + cronName, "novachess.dev/launched-by": "dashboard"}},
@@ -145,6 +150,27 @@ func (c *k8sCluster) CreateJobFromCron(ctx context.Context, cronName, jobName st
 	}
 	_, err = c.cs.BatchV1().Jobs(c.namespace).Create(ctx, job, metav1.CreateOptions{})
 	return err
+}
+
+// rewriteElements applies rewrite to every element of tokens in order. A nil
+// rewrite leaves tokens unchanged. An element rewritten to the empty string
+// is dropped, and a result containing spaces expands into several tokens on
+// return - which is how a caller adds or removes elements (for example the
+// gatekeeper's -incumbent flag and its value) despite the mapping being
+// expressed one element at a time.
+func rewriteElements(tokens []string, rewrite func(string) string) []string {
+	if rewrite == nil {
+		return tokens
+	}
+	out := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		r := rewrite(t)
+		if r == "" {
+			continue
+		}
+		out = append(out, strings.Fields(r)...)
+	}
+	return out
 }
 
 func (c *k8sCluster) Job(ctx context.Context, name string) (JobState, error) {

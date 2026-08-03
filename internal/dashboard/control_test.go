@@ -3,6 +3,7 @@ package dashboard
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,14 @@ type fakeCluster struct {
 	jobCommands  [][]string
 	jobArgs      [][]string
 	jobCronNames []string
+
+	// cronCommand and cronArgs stand in for the real CronJob templates in
+	// deploy/jobs.yaml, tuned flags included, so tests can assert that a
+	// launched Job's command carries the template's tuning verbatim and
+	// only the generation-numbered paths were rewritten - mirroring what
+	// k8sCluster.CreateJobFromCron does against the real template.
+	cronCommand map[string][]string
+	cronArgs    map[string][]string
 
 	// calls is a single ordered log across every method, so tests can assert
 	// relative order between calls that land in different fields above (e.g.
@@ -51,6 +60,24 @@ func newFakeCluster() *fakeCluster {
 	return &fakeCluster{
 		scales:   make(map[string][]int32),
 		replicas: make(map[string]int32),
+		cronCommand: map[string][]string{
+			CronTrainer: {
+				"/usr/local/bin/trainer",
+				"-out", "/data/networks/gen0.nnue",
+				"-epochs", "10",
+				"-batch", "1024",
+				"-lr", "0.001",
+			},
+			CronGatekeeper: {
+				"/usr/local/bin/gatekeeper",
+				"-candidate", "/data/networks/gen0.nnue",
+				"-games", "2000",
+				"-nodes", "20000",
+			},
+		},
+		cronArgs: map[string][]string{
+			CronTrainer: {"/data/gen0/"},
+		},
 	}
 }
 
@@ -72,11 +99,11 @@ func (f *fakeCluster) SetCoordinatorGeneration(_ context.Context, generation int
 	return nil
 }
 
-func (f *fakeCluster) CreateJobFromCron(_ context.Context, cronName, jobName string, command, args []string) error {
+func (f *fakeCluster) CreateJobFromCron(_ context.Context, cronName, jobName string, rewrite func(string) string) error {
 	f.jobs = append(f.jobs, jobName)
 	f.jobCronNames = append(f.jobCronNames, cronName)
-	f.jobCommands = append(f.jobCommands, command)
-	f.jobArgs = append(f.jobArgs, args)
+	f.jobCommands = append(f.jobCommands, rewriteElements(f.cronCommand[cronName], rewrite))
+	f.jobArgs = append(f.jobArgs, rewriteElements(f.cronArgs[cronName], rewrite))
 	return nil
 }
 
@@ -211,6 +238,39 @@ func TestAdvanceAfterPromotion(t *testing.T) {
 	}
 }
 
+// TestAdvanceRefusesWithMissingNetworkFile checks Finding 5: a promotion
+// record without the corresponding network file on disk is a refusal (409),
+// the same as an outright missing promotion, not an unrelated 500 - both are
+// the controller declining to act rather than a transport or cluster
+// failure.
+func TestAdvanceRefusesWithMissingNetworkFile(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	// A promotion record for generation 0 exists, but its network file was
+	// never written to (or was removed from) the data volume.
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	if err := h.Append(Record{Type: "gate", Generation: 0, Promoted: true, At: time.Now()}); err != nil {
+		t.Fatalf("append history: %v", err)
+	}
+	ct := NewController(fc, h, dataDir, 4)
+
+	err := ct.AdvanceGeneration(ctx, 1)
+	if err == nil {
+		t.Fatal("expected AdvanceGeneration to error when the network file is missing")
+	}
+	var refused *RefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("expected a *RefusedError (409), got %T: %v", err, err)
+	}
+	if len(fc.coordGen) != 0 {
+		t.Fatalf("expected no SetCoordinatorGeneration call, got %v", fc.coordGen)
+	}
+	if len(fc.scales[DeployCoordinator]) != 0 {
+		t.Fatalf("expected no coordinator scale call, got %v", fc.scales[DeployCoordinator])
+	}
+}
+
 func TestTrainerRefusedWhileCoordinatorRuns(t *testing.T) {
 	ctx := context.Background()
 	fc := newFakeCluster()
@@ -286,6 +346,105 @@ func TestGatekeeperIncludesIncumbentWhenPresent(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected -incumbent flag when incumbent file exists, got %v", cmd)
+	}
+}
+
+// TestTrainerFlagsSurviveLaunchVerbatim is Finding 3's core assertion: tuned
+// hyperparameters baked into the CronJob template must reach the launched
+// Job unchanged, while only the generation-numbered paths are rewritten to
+// target the requested generation. Before the fix, CreateJobFromCron
+// replaced the whole Command/Args and these flags would have silently
+// vanished.
+func TestTrainerFlagsSurviveLaunchVerbatim(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartTrainer(ctx, 3, true); err != nil {
+		t.Fatalf("StartTrainer: %v", err)
+	}
+
+	cmd := fc.jobCommands[0]
+	wantVerbatim := [][2]string{{"-epochs", "10"}, {"-batch", "1024"}, {"-lr", "0.001"}}
+	for _, pair := range wantVerbatim {
+		found := false
+		for i, arg := range cmd {
+			if arg == pair[0] {
+				found = true
+				if i+1 >= len(cmd) || cmd[i+1] != pair[1] {
+					t.Fatalf("expected %s to be followed by %s verbatim, got %v", pair[0], pair[1], cmd)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected tuned flag %s to survive launch, got %v", pair[0], cmd)
+		}
+	}
+
+	found := false
+	for i, arg := range cmd {
+		if arg == "-out" {
+			found = true
+			if i+1 >= len(cmd) || cmd[i+1] != "/data/networks/gen3.nnue" {
+				t.Fatalf("expected -out rewritten to target generation 3, got %v", cmd)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected -out flag present, got %v", cmd)
+	}
+
+	args := fc.jobArgs[0]
+	if len(args) != 1 || args[0] != "/data/gen3/" {
+		t.Fatalf("expected args rewritten to /data/gen3/, got %v", args)
+	}
+}
+
+// TestGatekeeperFlagsSurviveLaunchVerbatim is the gatekeeper counterpart: its
+// tuned -games/-nodes flags must survive while -candidate is rewritten to
+// the target generation.
+func TestGatekeeperFlagsSurviveLaunchVerbatim(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	writeNetworkFile(t, dataDir, 2)
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartGatekeeper(ctx, 2); err != nil {
+		t.Fatalf("StartGatekeeper: %v", err)
+	}
+
+	cmd := fc.jobCommands[0]
+	wantVerbatim := [][2]string{{"-games", "2000"}, {"-nodes", "20000"}}
+	for _, pair := range wantVerbatim {
+		found := false
+		for i, arg := range cmd {
+			if arg == pair[0] {
+				found = true
+				if i+1 >= len(cmd) || cmd[i+1] != pair[1] {
+					t.Fatalf("expected %s to be followed by %s verbatim, got %v", pair[0], pair[1], cmd)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected tuned flag %s to survive launch, got %v", pair[0], cmd)
+		}
+	}
+
+	found := false
+	for i, arg := range cmd {
+		if arg == "-candidate" {
+			found = true
+			if i+1 >= len(cmd) || cmd[i+1] != "/data/networks/gen2.nnue" {
+				t.Fatalf("expected -candidate rewritten to target generation 2, got %v", cmd)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected -candidate flag present, got %v", cmd)
 	}
 }
 

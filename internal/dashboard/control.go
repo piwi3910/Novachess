@@ -5,8 +5,85 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
+
+// genDirPattern matches a per-generation data directory path, e.g.
+// /data/gen3/, wherever it appears in a Command or Args element.
+var genDirPattern = regexp.MustCompile(`/data/gen\d+/`)
+
+// networkFilePattern matches a network artifact path, e.g.
+// /data/networks/gen3.nnue, as a whole element.
+var networkFilePattern = regexp.MustCompile(`^/data/networks/gen\d+\.nnue$`)
+
+// generationPathRewriter rewrites the per-generation data directory and any
+// network path following -out or -candidate to target generation, leaving
+// every other element - including tuned hyperparameters like -epochs or
+// -games baked into the CronJob template - untouched. This is what lets the
+// trainer and gatekeeper Jobs launch with the template's real tuning instead
+// of the dashboard's own hardcoded flags.
+func generationPathRewriter(generation int) func(string) string {
+	var prev string
+	return func(elem string) string {
+		out := elem
+		switch {
+		case genDirPattern.MatchString(elem):
+			out = genDirPattern.ReplaceAllString(elem, fmt.Sprintf("/data/gen%d/", generation))
+		case networkFilePattern.MatchString(elem) && (prev == "-out" || prev == "-candidate"):
+			out = fmt.Sprintf("/data/networks/gen%d.nnue", generation)
+		}
+		prev = elem
+		return out
+	}
+}
+
+// gatekeeperRewriter extends generationPathRewriter with the -incumbent
+// flag's generation-aware handling: pointed at generation-1 when it should
+// be present, removed entirely when it should not (generation 0, or no
+// incumbent file on disk), and inserted right after the candidate path when
+// the template does not carry the flag at all - which is the shape of the
+// gatekeeper CronJob template today (see deploy/jobs.yaml): generation 0 has
+// no -incumbent baked in because there is nothing to gate against yet, and
+// later generations need it added rather than merely rewritten.
+//
+// The insertion point is the candidate path because it is guaranteed to
+// appear exactly once, immediately after -candidate, in every gatekeeper
+// invocation; if a future template ever bakes an explicit -incumbent flag in
+// as well, this would append a second one; nothing in the current template
+// does.
+func gatekeeperRewriter(generation int, includeIncumbent bool) func(string) string {
+	base := generationPathRewriter(generation)
+	incumbentPath := fmt.Sprintf("/data/networks/gen%d.nnue", generation-1)
+
+	var prev string
+	removeNext := false
+	return func(elem string) string {
+		if removeNext {
+			removeNext = false
+			prev = elem
+			return ""
+		}
+		if elem == "-incumbent" {
+			prev = elem
+			if !includeIncumbent {
+				removeNext = true
+				return ""
+			}
+			return elem
+		}
+
+		out := base(elem)
+		switch {
+		case prev == "-incumbent" && includeIncumbent:
+			out = incumbentPath
+		case prev == "-candidate" && includeIncumbent:
+			out = out + " -incumbent " + incumbentPath
+		}
+		prev = elem
+		return out
+	}
+}
 
 // RefusedError marks a guardrail refusal - a request the controller
 // deliberately declines because acting on it would corrupt training state,
@@ -90,9 +167,7 @@ func (ct *Controller) StartTrainer(ctx context.Context, generation int, force bo
 		}
 	}
 	jobName := fmt.Sprintf("train-gen%d-%d", generation, time.Now().Unix())
-	command := []string{"/usr/local/bin/trainer", "-out", fmt.Sprintf("/data/networks/gen%d.nnue", generation)}
-	args := []string{fmt.Sprintf("/data/gen%d/", generation)}
-	if err := ct.cluster.CreateJobFromCron(ctx, CronTrainer, jobName, command, args); err != nil {
+	if err := ct.cluster.CreateJobFromCron(ctx, CronTrainer, jobName, generationPathRewriter(generation)); err != nil {
 		return "", err
 	}
 	return jobName, nil
@@ -108,15 +183,15 @@ func (ct *Controller) StartGatekeeper(ctx context.Context, generation int) (stri
 	if _, err := os.Stat(candidatePath); err != nil {
 		return "", &RefusedError{Reason: fmt.Sprintf("dashboard: candidate network for generation %d not found: %v", generation, err)}
 	}
-	command := []string{"/usr/local/bin/gatekeeper", "-candidate", fmt.Sprintf("/data/networks/gen%d.nnue", generation)}
+	includeIncumbent := false
 	if generation > 0 {
 		incumbentPath := filepath.Join(ct.dataDir, "networks", fmt.Sprintf("gen%d.nnue", generation-1))
 		if _, err := os.Stat(incumbentPath); err == nil {
-			command = append(command, "-incumbent", fmt.Sprintf("/data/networks/gen%d.nnue", generation-1))
+			includeIncumbent = true
 		}
 	}
 	jobName := fmt.Sprintf("gate-gen%d-%d", generation, time.Now().Unix())
-	if err := ct.cluster.CreateJobFromCron(ctx, CronGatekeeper, jobName, command, nil); err != nil {
+	if err := ct.cluster.CreateJobFromCron(ctx, CronGatekeeper, jobName, gatekeeperRewriter(generation, includeIncumbent)); err != nil {
 		return "", err
 	}
 	return jobName, nil
@@ -133,7 +208,7 @@ func (ct *Controller) AdvanceGeneration(ctx context.Context, toGeneration int) e
 	}
 	networkFile := fmt.Sprintf("gen%d.nnue", from)
 	if _, err := os.Stat(filepath.Join(ct.dataDir, "networks", networkFile)); err != nil {
-		return fmt.Errorf("dashboard: network file for generation %d not found: %w", from, err)
+		return &RefusedError{Reason: fmt.Sprintf("dashboard: network file for generation %d not found: %v", from, err)}
 	}
 	networkURI := fmt.Sprintf("file:///data/networks/%s", networkFile)
 	if err := ct.cluster.SetCoordinatorGeneration(ctx, toGeneration, networkURI); err != nil {

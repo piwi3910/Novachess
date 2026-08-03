@@ -59,6 +59,27 @@ func NewHistory(path string) *History {
 func (h *History) Append(r Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	return h.appendLocked(r)
+}
+
+// AppendIfAbsent appends r unless a record already satisfies matches, and is
+// what makes replaying the retained event stream on every restart safe: the
+// same dataset-ready or gate event arriving twice appends once. The check
+// and the append happen under the same lock so two near-simultaneous
+// deliveries of the same event cannot both pass the check before either
+// appends.
+func (h *History) AppendIfAbsent(r Record, matches func(Record) bool) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, existing := range h.records {
+		if matches(existing) {
+			return nil
+		}
+	}
+	return h.appendLocked(r)
+}
+
+func (h *History) appendLocked(r Record) error {
 	line, err := json.Marshal(r)
 	if err != nil {
 		return err

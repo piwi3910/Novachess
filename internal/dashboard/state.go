@@ -42,6 +42,7 @@ type State struct {
 	mu       sync.Mutex
 	boards   map[string]Board
 	progress GenProgress
+	target   int
 	watchers map[chan struct{}]struct{}
 }
 
@@ -50,6 +51,19 @@ func NewState() *State {
 		boards:   make(map[string]Board),
 		watchers: make(map[chan struct{}]struct{}),
 	}
+}
+
+// SetTarget records the positions target for the current generation (from
+// NOVA_POSITIONS), independent of the batch-driven progress counters. It is
+// set once at startup rather than folded into GenProgress, because progress
+// is rebuilt from scratch on every generation rollover (see WatchEvents) and
+// would otherwise drop the target the moment the first batch of a new
+// generation arrived.
+func (s *State) SetTarget(target int) {
+	s.mu.Lock()
+	s.target = target
+	s.mu.Unlock()
+	s.notify()
 }
 
 func (s *State) NoteHeartbeat(hb events.WorkerHeartbeat, at time.Time) {
@@ -77,7 +91,9 @@ func (s *State) NoteProgress(p GenProgress) {
 func (s *State) Snapshot(now time.Time) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := Snapshot{Generation: s.progress, Boards: []Board{}}
+	gen := s.progress
+	gen.Target = s.target
+	out := Snapshot{Generation: gen, Boards: []Board{}}
 	for _, b := range s.boards {
 		b.Stale = now.Sub(b.LastSeen) > StaleAfter
 		out.Boards = append(out.Boards, b)

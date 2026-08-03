@@ -96,7 +96,27 @@ type Config struct {
 	//
 	// Queue subscriptions ignore this and derive their durable name from the
 	// group, since sharing is the entire point there.
+	//
+	// Ignored on fan-out subscriptions when ReplayAll is set; see ReplayAll.
 	Durable string
+
+	// ReplayAll makes fan-out subscriptions (Subscribe, not QueueSubscribe)
+	// use a fresh ephemeral consumer with DeliverAll on every connection,
+	// instead of a durable consumer that resumes past its acked position.
+	//
+	// This is for a service whose state from the stream lives in memory
+	// only, such as the dashboard's generation progress: after a restart, a
+	// durable consumer would come back showing nothing until new messages
+	// arrived, even though the stream still holds the whole retention
+	// window. Replaying it all and deduping on the receiving end (by work
+	// unit, by generation, by whatever key the caller's records use)
+	// rebuilds the same state a durable consumer would have kept, every
+	// time, at the cost of reprocessing the window on every reconnect.
+	//
+	// Leave this false for a service that only cares what happens from now
+	// on, or whose state is durable on its own side (a worker's played work
+	// units, for instance) — those want Durable instead.
+	ReplayAll bool
 
 	// MaxInFlight bounds unacknowledged messages.
 	//

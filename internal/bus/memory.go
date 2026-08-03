@@ -23,6 +23,13 @@ import (
 // DeliveryErrors rather than retried, because a synchronous retry loop would
 // deadlock the publisher. Tests that need to exercise at-least-once semantics
 // should call Publish twice.
+//
+// Retained-window replay (Config.ReplayAll on the NATS implementation) is
+// not modelled either: Subscribe only ever delivers messages published after
+// the call, never a backlog, regardless of ReplayAll. A test standing in for
+// a dashboard restart needs to publish the same events again after
+// re-subscribing to simulate what a ReplayAll consumer would redeliver on
+// its own against a real broker.
 type Memory struct {
 	mu       sync.RWMutex
 	subs     map[string][]*memorySub

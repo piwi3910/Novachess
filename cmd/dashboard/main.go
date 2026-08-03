@@ -37,6 +37,11 @@ func main() {
 		log.Error("bad NOVA_WORKER_REPLICAS")
 		os.Exit(1)
 	}
+	positionsTarget, err := strconv.Atoi(env("NOVA_POSITIONS", "1000000"))
+	if err != nil || positionsTarget < 0 {
+		log.Error("bad NOVA_POSITIONS")
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -45,7 +50,13 @@ func main() {
 	b, err := bus.Connect(connectCtx, bus.Config{
 		URLs:       urls,
 		ClientName: env("HOSTNAME", "dashboard"),
-		Durable:    "dashboard",
+		// ReplayAll rather than Durable: the dashboard's generation progress
+		// lives in memory only, so a durable consumer that resumed past its
+		// acked position would come back from a restart showing zero
+		// progress even though the stream still holds the whole window. An
+		// ephemeral, replay-everything consumer rebuilds the same state a
+		// durable one would have kept, every time.
+		ReplayAll: true,
 	})
 	cancel()
 	if err != nil {
@@ -66,6 +77,7 @@ func main() {
 	}
 
 	state := dashboard.NewState()
+	state.SetTarget(positionsTarget)
 	history := dashboard.NewHistory(filepath.Join(dataDir, "dashboard", "history.jsonl"))
 	ctl := dashboard.NewController(cluster, history, dataDir, int32(replicas))
 
