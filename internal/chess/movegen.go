@@ -122,42 +122,75 @@ func (p *Position) genKingMoves(ml *MoveList, ksq Square, them Color, occ, ourPi
 
 // genCastling generates castling moves. It is only called when the side to move
 // is not in check, so that condition is not retested here.
+//
+// This is generalized over Chess960: the rook's origin comes from the position
+// rather than a fixed square, and the squares that must be empty are
+// precomputed per right, since in Chess960 the king's and rook's paths overlap
+// and either piece may already stand on its own destination.
 func (p *Position) genCastling(ml *MoveList, us Color, occ Bitboard) {
 	them := us.Opposite()
+	kingFrom := p.KingSquare(us)
 
-	// kingSide and queenSide differ only by squares, so they are tabulated:
-	// the right, the squares that must be empty, the squares the king crosses
-	// (which must not be attacked), and the king's origin and destination.
-	type castlingSpec struct {
-		right     CastlingRights
-		emptyPath Bitboard
-		kingPath  [2]Square
-		from, to  Square
-	}
-	var specs [2]castlingSpec
-	if us == White {
-		specs = [2]castlingSpec{
-			{WhiteKingSide, F1.BB() | G1.BB(), [2]Square{F1, G1}, E1, G1},
-			{WhiteQueenSide, B1.BB() | C1.BB() | D1.BB(), [2]Square{D1, C1}, E1, C1},
-		}
-	} else {
-		specs = [2]castlingSpec{
-			{BlackKingSide, F8.BB() | G8.BB(), [2]Square{F8, G8}, E8, G8},
-			{BlackQueenSide, B8.BB() | C8.BB() | D8.BB(), [2]Square{D8, C8}, E8, C8},
-		}
-	}
-
-	for _, s := range specs {
-		if !p.castling.Has(s.right) || occ&s.emptyPath != 0 {
+	for i := 0; i < 2; i++ {
+		idx := castlingIndex(us, i == 0)
+		if !p.castling.Has(rightAt(idx)) {
 			continue
 		}
-		// b1/b8 may be attacked during queenside castling — only the squares
-		// the king actually crosses matter, which is why kingPath is separate
-		// from emptyPath.
-		if p.IsAttacked(s.kingPath[0], them) || p.IsAttacked(s.kingPath[1], them) {
+		if occ&p.castlingPath[idx] != 0 {
 			continue
 		}
-		ml.Add(NewCastling(s.from, s.to))
+
+		rookFrom := p.castlingRook[idx]
+		// Rights are only recorded once the rook has been located, and are
+		// revoked whenever its square is touched, so this should never fire.
+		// It is checked anyway because the failure mode is relocating a piece
+		// that does not exist, which panics rather than plays a bad move.
+		if p.board[rookFrom] != MakePiece(us, Rook) {
+			continue
+		}
+
+		// Every square the king occupies or crosses must be unattacked. Only
+		// the king's path matters: the rook may pass over an attacked square,
+		// which is why b1/b8 does not prevent queenside castling.
+		kingTo := castlingKingTo(idx)
+		if p.kingPathAttacked(kingFrom, kingTo, them) {
+			continue
+		}
+
+		// The castling rook may itself be shielding the king's destination.
+		// Once it steps away, a rook or queen behind it can attack the square
+		// the king is about to occupy — an enemy queen on a1 with the castling
+		// rook on b1 is the standard case. Nothing above catches this, because
+		// with the rook still in place the square looks safe.
+		//
+		// This is a Chess960 shape, but the test is applied unconditionally:
+		// in classical chess the castling rook stands on a corner with nothing
+		// behind it, so the check can never fire and costs only itself.
+		if RookAttacks(kingTo, occ^rookFrom.BB())&
+			(p.byType[Rook]|p.byType[Queen])&p.byColor[them] != 0 {
+			continue
+		}
+
+		// Encoded king-takes-rook: see castling.go for why the king's
+		// destination cannot be used here.
+		ml.Add(NewCastling(kingFrom, rookFrom))
+	}
+}
+
+// kingPathAttacked reports whether any square from origin to destination
+// inclusive is attacked. The two are always on the same rank.
+func (p *Position) kingPathAttacked(from, to Square, by Color) bool {
+	step := 1
+	if to < from {
+		step = -1
+	}
+	for sq := from; ; sq = Square(int(sq) + step) {
+		if p.IsAttacked(sq, by) {
+			return true
+		}
+		if sq == to {
+			return false
+		}
 	}
 }
 

@@ -40,26 +40,25 @@ type Position struct {
 
 	key uint64
 
+	// chess960 selects how castling moves and the FEN castling field are
+	// written. Move generation does not consult it: the generator is
+	// generalized and correct for both variants.
+	chess960 bool
+
+	// castlingRook holds each right's rook origin, and castlingPath the
+	// squares that must be empty for it. Both are per-position because
+	// Chess960 starts the rooks on arbitrary files.
+	castlingRook [castlingIndexCount]Square
+	castlingPath [castlingIndexCount]Bitboard
+
+	// crMask[s] holds the rights that survive when square s is touched by a
+	// move, as either origin or destination. A king or rook leaving its home
+	// square loses the corresponding rights, and so does a rook captured on
+	// its home square — the latter is easy to forget and produces bugs only
+	// perft catches. This is per-position for the same reason as the above.
+	crMask [SquareCount]CastlingRights
+
 	history []undo
-}
-
-// castlingRightsMask[s] holds the rights that survive when square s is touched
-// by a move, as either origin or destination. A king or rook leaving its home
-// square loses the corresponding rights, and so does a rook being captured on
-// its home square — the latter is easy to forget and produces subtle bugs that
-// only perft catches.
-var castlingRightsMask [SquareCount]CastlingRights
-
-func init() {
-	for i := range castlingRightsMask {
-		castlingRightsMask[i] = AllCastling
-	}
-	castlingRightsMask[E1] &^= WhiteKingSide | WhiteQueenSide
-	castlingRightsMask[H1] &^= WhiteKingSide
-	castlingRightsMask[A1] &^= WhiteQueenSide
-	castlingRightsMask[E8] &^= BlackKingSide | BlackQueenSide
-	castlingRightsMask[H8] &^= BlackKingSide
-	castlingRightsMask[A8] &^= BlackQueenSide
 }
 
 // NewPosition returns the standard starting position.
@@ -80,6 +79,12 @@ func emptyPosition() *Position {
 	}
 	for i := range p.board {
 		p.board[i] = NoPiece
+	}
+	for i := range p.crMask {
+		p.crMask[i] = AllCastling
+	}
+	for i := range p.castlingRook {
+		p.castlingRook[i] = NoSquare
 	}
 	return p
 }
@@ -228,9 +233,16 @@ func (p *Position) MakeMove(m Move) {
 
 	switch kind {
 	case KindCastling:
-		rookFrom, rookTo := castlingRookSquares(to)
-		p.movePiece(from, to)
-		p.movePiece(rookFrom, rookTo)
+		// The move is encoded king-takes-rook, so `to` is the rook's square.
+		// Both pieces are lifted before either is placed: in Chess960 their
+		// origins and destinations overlap freely — a king may not move at
+		// all, and king and rook may swap squares — so any move-then-move
+		// order would overwrite a piece that has not been read yet.
+		idx := castlingIndex(us, isKingSideCastling(m))
+		p.removePiece(from)
+		p.removePiece(to)
+		p.putPiece(MakePiece(us, King), castlingKingTo(idx))
+		p.putPiece(MakePiece(us, Rook), castlingRookTo(idx))
 
 	case KindEnPassant:
 		// The captured pawn sits beside the destination, not on it.
@@ -255,10 +267,20 @@ func (p *Position) MakeMove(m Move) {
 		p.movePiece(from, to)
 		if moved.Type() == Pawn {
 			p.halfmove = 0
-			// A double push sets the en passant target square behind the pawn.
+			// A double push sets the en passant target square behind the pawn,
+			// but only when an opponent pawn can actually capture there.
+			//
+			// This is a rules requirement, not an optimization. FIDE compares
+			// positions for repetition by the moves available in them, so two
+			// positions differing only by an en passant target that no pawn
+			// could ever use are the same position and must hash identically.
+			// Recording the square unconditionally would make a threefold
+			// repetition go undetected, losing a draw the rules grant.
 			if abs(int(to)-int(from)) == 16 {
-				p.epSquare = Square(int(from) + PawnPush(us))
-				p.key ^= zobristEPFile[p.epSquare.File()]
+				if epSq := Square(int(from) + PawnPush(us)); p.epCaptureAvailable(epSq, them) {
+					p.epSquare = epSq
+					p.key ^= zobristEPFile[epSq.File()]
+				}
 			}
 		}
 	}
@@ -266,7 +288,7 @@ func (p *Position) MakeMove(m Move) {
 	// Touching a king or rook home square revokes the matching rights, whether
 	// the piece moved from it or was captured on it.
 	if p.castling != NoCastling {
-		newRights := p.castling & castlingRightsMask[from] & castlingRightsMask[to]
+		newRights := p.castling & p.crMask[from] & p.crMask[to]
 		if newRights != p.castling {
 			p.key ^= zobristCastling[p.castling] ^ zobristCastling[newRights]
 			p.castling = newRights
@@ -298,9 +320,13 @@ func (p *Position) UnmakeMove() {
 
 	switch u.move.Kind() {
 	case KindCastling:
-		rookFrom, rookTo := castlingRookSquares(to)
-		p.movePiece(to, from)
-		p.movePiece(rookTo, rookFrom)
+		// Mirror of MakeMove: lift both pieces from their destinations before
+		// restoring either origin, since the four squares may overlap.
+		idx := castlingIndex(us, isKingSideCastling(u.move))
+		p.removePiece(castlingKingTo(idx))
+		p.removePiece(castlingRookTo(idx))
+		p.putPiece(MakePiece(us, King), from)
+		p.putPiece(MakePiece(us, Rook), to)
 
 	case KindEnPassant:
 		p.movePiece(to, from)
@@ -332,32 +358,68 @@ func (p *Position) UnmakeMove() {
 	p.key = u.key
 }
 
-// castlingRookSquares maps the king's destination square to the rook's origin
-// and destination.
-func castlingRookSquares(kingTo Square) (from, to Square) {
-	switch kingTo {
-	case G1:
-		return H1, F1
-	case C1:
-		return A1, D1
-	case G8:
-		return H8, F8
-	case C8:
-		return A8, D8
+// epCaptureAvailable reports whether the given side has a pawn that can legally
+// capture en passant onto epSq.
+//
+// "Legally" is doing real work here: a pawn may attack the square and still be
+// unable to make the capture, because en passant removes two pieces from one
+// rank at once and can expose its own king. Such a position has no en passant
+// possibility at all, and must not record one.
+func (p *Position) epCaptureAvailable(epSq Square, capturer Color) bool {
+	if epSq >= NoSquare || p.board[epSq] != NoPiece {
+		return false
 	}
-	panic("chess: invalid castling destination " + kingTo.String())
+	them := capturer.Opposite()
+
+	// The pawn to be captured must actually be standing beside the target.
+	capSq := Square(int(epSq) - PawnPush(capturer))
+	if p.board[capSq] != MakePiece(them, Pawn) {
+		return false
+	}
+
+	// Squares from which a pawn of the capturing color attacks epSq are the
+	// squares a pawn of the opposite color standing on epSq would attack.
+	candidates := PawnAttacks[them][epSq] & p.ColorPiecesOfType(capturer, Pawn)
+	if candidates == 0 {
+		return false
+	}
+
+	ksq := p.KingSquare(capturer)
+	occ := p.Occupied()
+	for candidates != 0 {
+		var from Square
+		from, candidates = candidates.PopFirst()
+		if p.enPassantLegal(from, epSq, capturer, ksq, occ) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseFEN parses a position in Forsyth-Edwards Notation. The halfmove clock
 // and fullmove number are optional, defaulting to 0 and 1, since many test
 // suites and opening books omit them.
-func ParseFEN(fen string) (*Position, error) {
+func ParseFEN(fen string) (*Position, error) { return parseFEN(fen, false) }
+
+// ParseFENVariant parses a FEN, forcing the Chess960 interpretation on or off
+// rather than inferring it.
+//
+// Inference works only when the castling field uses Shredder notation, so a
+// Chess960 position that has already lost both castling rights is
+// indistinguishable from a classical one — and harmlessly so, since the flag
+// only affects how castling is written and there is no castling left to write.
+// UCI callers should use this with the value of the UCI_Chess960 option rather
+// than relying on inference.
+func ParseFENVariant(fen string, chess960 bool) (*Position, error) { return parseFEN(fen, chess960) }
+
+func parseFEN(fen string, chess960 bool) (*Position, error) {
 	fields := strings.Fields(fen)
 	if len(fields) < 4 {
 		return nil, fmt.Errorf("chess: FEN needs at least 4 fields, got %d: %q", len(fields), fen)
 	}
 
 	p := emptyPosition()
+	p.chess960 = chess960
 
 	ranks := strings.Split(fields[0], "/")
 	if len(ranks) != 8 {
@@ -397,21 +459,16 @@ func ParseFEN(fen string) (*Position, error) {
 		return nil, fmt.Errorf("chess: invalid side to move %q", fields[1])
 	}
 
-	if fields[2] != "-" {
-		for _, ch := range []byte(fields[2]) {
-			switch ch {
-			case 'K':
-				p.castling |= WhiteKingSide
-			case 'Q':
-				p.castling |= WhiteQueenSide
-			case 'k':
-				p.castling |= BlackKingSide
-			case 'q':
-				p.castling |= BlackQueenSide
-			default:
-				return nil, fmt.Errorf("chess: invalid castling right %q", string(ch))
-			}
+	// Castling needs the kings located, so reject kingless positions before
+	// resolving it rather than letting KingSquare read an empty bitboard.
+	for c := White; c <= Black; c++ {
+		if n := p.ColorPiecesOfType(c, King).Count(); n != 1 {
+			return nil, fmt.Errorf("chess: %s has %d kings, want exactly 1", c, n)
 		}
+	}
+
+	if err := p.parseCastlingField(fields[2]); err != nil {
+		return nil, err
 	}
 
 	if fields[3] != "-" {
@@ -440,9 +497,92 @@ func ParseFEN(fen string) (*Position, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
+	p.sanitize()
 
 	p.key = p.computeKey()
 	return p, nil
+}
+
+// parseCastlingField reads the castling field of a FEN, in either the classical
+// KQkq form or the Shredder form that names each rook by file (AHah).
+//
+// A right whose rook cannot be located is silently dropped. That is the
+// sanitization path for castling: believing an unsupported right is a crash,
+// because the generator would emit a castling move and playing it would
+// relocate a piece that is not there.
+func (p *Position) parseCastlingField(field string) error {
+	if field == "-" {
+		return nil
+	}
+
+	for _, ch := range []byte(field) {
+		var us Color
+		var rookFrom Square
+		var kingSide bool
+
+		switch {
+		case ch == 'K', ch == 'Q', ch == 'k', ch == 'q':
+			us = White
+			if ch == 'k' || ch == 'q' {
+				us = Black
+			}
+			kingSide = ch == 'K' || ch == 'k'
+
+			found, ok := p.findCastlingRook(us, kingSide)
+			if !ok {
+				continue // no rook to castle with; drop the right
+			}
+			rookFrom = found
+
+		case ch >= 'A' && ch <= 'H', ch >= 'a' && ch <= 'h':
+			// Shredder notation names the rook's file directly, which is the
+			// only unambiguous form when both rooks sit on the same side of
+			// the king or the king is not on the e-file.
+			var rank, file int
+			if ch >= 'a' {
+				us, rank, file = Black, 7, int(ch-'a')
+			} else {
+				us, rank, file = White, 0, int(ch-'A')
+			}
+			rookFrom = MakeSquare(file, rank)
+			if p.board[rookFrom] != MakePiece(us, Rook) {
+				continue // drop a right whose rook is not there
+			}
+			ksq := p.KingSquare(us)
+			if ksq.Rank() != rank {
+				continue // a king off its back rank cannot castle
+			}
+			kingSide = rookFrom > ksq
+			p.chess960 = true
+
+		default:
+			return fmt.Errorf("chess: invalid castling right %q", string(ch))
+		}
+
+		p.setCastlingRight(castlingIndex(us, kingSide), rookFrom)
+	}
+	return nil
+}
+
+// sanitize corrects fields that a FEN may assert but the board contradicts.
+//
+// These are silently repaired rather than rejected, because FENs arrive from
+// GUIs, opening books and web APIs that are routinely sloppy about them, and
+// refusing an otherwise perfectly legal position over a stale castling flag
+// would break interoperability for no benefit. What must not happen is
+// believing them.
+func (p *Position) sanitize() {
+	// Castling rights are already sanitized during parsing: a right is only
+	// recorded once its rook has been located on the board, so an unsupported
+	// flag never reaches this point.
+
+	// An en passant target no pawn can legally use is not part of the
+	// position: FIDE distinguishes positions by the moves available in them.
+	// Keeping it would hash this position differently from the identical one
+	// reached by another move order, hiding a repetition draw.
+	if p.epSquare != NoSquare && !p.epCaptureAvailable(p.epSquare, p.side) {
+		p.epSquare = NoSquare
+	}
 }
 
 // validate rejects positions the move generator would misbehave on. It is
@@ -496,7 +636,7 @@ func (p *Position) FEN() string {
 	} else {
 		sb.WriteString(" b ")
 	}
-	sb.WriteString(p.castling.String())
+	sb.WriteString(p.castlingFEN())
 	sb.WriteByte(' ')
 	sb.WriteString(p.epSquare.String())
 	sb.WriteByte(' ')
