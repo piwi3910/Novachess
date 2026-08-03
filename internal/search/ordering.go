@@ -29,10 +29,17 @@ const (
 // ordering wants a stable, simple ranking, not a tuned one.
 var pieceValue = [chess.PieceTypeCount]int{100, 320, 330, 500, 900, 20000}
 
-// scoreMoves assigns an ordering score to each move in the list, returning the
-// scores in a parallel array.
-func (st *state) scoreMoves(ml *chess.MoveList, ttMove chess.Move, ply int) *[chess.MaxMoves]int {
-	var scores [chess.MaxMoves]int
+// scoreMoves assigns an ordering score to each move in the list, writing into
+// this ply's slot of the pre-allocated score stack and returning it.
+//
+// The scores live in the search state rather than in a local array because a
+// local would escape to the heap: 2KB allocated at every node that generates
+// moves, which at a million nodes a second is gigabytes of garbage a second.
+// Indexing by ply is safe because only one node per ply is ever active — and
+// quiescence at a given ply is reached from a negamax node that returned before
+// scoring anything.
+func (st *state) scoreMoves(ml *chess.MoveList, ttMove chess.Move, ply int) *[chess.MaxMoves]int32 {
+	scores := &st.moveScores[ply]
 	us := st.pos.SideToMove()
 
 	for i, m := range ml.Slice() {
@@ -46,17 +53,17 @@ func (st *state) scoreMoves(ml *chess.MoveList, ttMove chess.Move, ply int) *[ch
 			// Queen promotions first; underpromotions are almost never best
 			// and are pushed below ordinary captures.
 			if m.Promotion() == chess.Queen {
-				scores[i] = scorePromotion + pieceValue[chess.Queen]
+				scores[i] = scorePromotion + int32(pieceValue[chess.Queen])
 			} else {
-				scores[i] = scoreQuietBase + int(m.Promotion())
+				scores[i] = scoreQuietBase + int32(m.Promotion())
 			}
 
 		case st.pos.IsCapture(m):
 			// Most Valuable Victim, Least Valuable Attacker: taking a queen
 			// with a pawn is tried before taking a pawn with a queen, because
 			// the first is far more likely to win material.
-			scores[i] = scoreGoodCapture + captureValue(st.pos, m)*16 -
-				pieceValue[st.pos.PieceAt(m.From()).Type()]
+			scores[i] = scoreGoodCapture + int32(captureValue(st.pos, m))*16 -
+				int32(pieceValue[st.pos.PieceAt(m.From()).Type()])
 
 		case m == st.killers[ply][0]:
 			scores[i] = scoreKiller1
@@ -65,17 +72,17 @@ func (st *state) scoreMoves(ml *chess.MoveList, ttMove chess.Move, ply int) *[ch
 
 		default:
 			// Quiet moves are ranked by how often they have caused cutoffs.
-			scores[i] = scoreQuietBase + int(st.history[us][m.From()][m.To()])
+			scores[i] = scoreQuietBase + st.history[us][m.From()][m.To()]
 		}
 	}
 
-	return &scores
+	return scores
 }
 
 // pickMove swaps the highest-scoring remaining move into position i and returns
 // it. Selection is done lazily so that a node cutting off after one move pays
 // for one scan rather than a full sort.
-func pickMove(ml *chess.MoveList, scores *[chess.MaxMoves]int, i int) chess.Move {
+func pickMove(ml *chess.MoveList, scores *[chess.MaxMoves]int32, i int) chess.Move {
 	best := i
 	for j := i + 1; j < ml.Count; j++ {
 		if scores[j] > scores[best] {

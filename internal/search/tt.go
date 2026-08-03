@@ -34,9 +34,10 @@ const (
 //
 // The key is truncated to 32 bits. The remaining bits of the position's Zobrist
 // key select the bucket, so a collision needs both the bucket and the stored
-// half to match. Collisions are still possible and are why the search never
-// trusts a table move without checking it is pseudo-legal in the current
-// position.
+// half to match. Collisions are still possible, which is why a table move is
+// only ever used for ordering: it is matched by equality against the generated
+// legal moves, so a move belonging to some other position simply never matches
+// and is silently ignored rather than played.
 type entry struct {
 	key32 uint32     // upper half of the Zobrist key
 	move  chess.Move // best move found, for ordering

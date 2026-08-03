@@ -119,6 +119,11 @@ type state struct {
 	// mover and destination. Unlike killers it is global to the search.
 	history [chess.ColorCount][chess.SquareCount][chess.SquareCount]int32
 
+	// moveScores is one ordering-score array per ply, pre-allocated so that
+	// scoring moves at a node costs nothing. A local array here would escape to
+	// the heap and allocate 2KB at every node.
+	moveScores [MaxPly][chess.MaxMoves]int32
+
 	// Triangular principal-variation table.
 	pv       [MaxPly][MaxPly]chess.Move
 	pvLength [MaxPly]int
