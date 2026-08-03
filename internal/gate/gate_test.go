@@ -3,6 +3,8 @@ package gate
 import (
 	"context"
 	"math"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/piwi3910/novachess/internal/chess"
@@ -18,6 +20,29 @@ import (
 type blindEval struct{}
 
 func (blindEval) Evaluate(*chess.Position) int { return 0 }
+
+// countingEval counts evaluations and can cancel a context once it has seen a
+// given number of them.
+//
+// It exists so that a test can interrupt a match at a reproducible point. The
+// match is deterministic, so a fixed number of evaluations is a fixed amount of
+// play — unlike a wall-clock deadline, which means different amounts of play on
+// a fast machine, a loaded one, and under the race detector.
+type countingEval struct {
+	inner  eval.Evaluator
+	calls  atomic.Int64
+	limit  int64
+	cancel context.CancelFunc
+}
+
+func (c *countingEval) Evaluate(p *chess.Position) int {
+	if n := c.calls.Add(1); c.limit > 0 && n == c.limit && c.cancel != nil {
+		c.cancel()
+	}
+	return c.inner.Evaluate(p)
+}
+
+func (c *countingEval) count() int64 { return c.calls.Load() }
 
 func testMatchConfig() MatchConfig {
 	c := DefaultMatchConfig()
@@ -334,9 +359,22 @@ func TestLOS(t *testing.T) {
 	if got := LOS(40, 60); got >= 0.5 {
 		t.Errorf("a losing record gives LOS %v, want below 0.5", got)
 	}
-	// Draws carry no information about which side is stronger.
-	if a, b := LOS(60, 40), LOS(60, 40); a != b {
-		t.Errorf("LOS is not a function of the decisive games alone: %v vs %v", a, b)
+	// The same win rate over more decisive games is stronger evidence. This is
+	// the property that makes LOS worth reporting at all: 60-40 and 600-400 are
+	// the same score and very different degrees of certainty.
+	if few, many := LOS(60, 40), LOS(600, 400); many <= few {
+		t.Errorf("LOS did not rise with more games at the same rate: %v over 100, %v over 1000", few, many)
+	}
+
+	// It rises monotonically, rather than merely ending up higher.
+	previous := 0.0
+	for _, n := range []int{100, 400, 900, 1600} {
+		wins := n * 60 / 100
+		los := LOS(wins, n-wins)
+		if los <= previous {
+			t.Errorf("LOS at %d games = %v, not above %v", n, los, previous)
+		}
+		previous = los
 	}
 }
 
@@ -412,6 +450,124 @@ func TestMatchHonoursContextCancellation(t *testing.T) {
 	}
 	if _, err := g.Test(ctx, eval.NewHCE(), blindEval{}); err == nil {
 		t.Error("the gate ignored a cancelled context")
+	}
+}
+
+// TestInterruptedGateStillReports checks that a run stopped part way through
+// says what it found. An operator who interrupts a long match, or a pod that is
+// evicted, has still paid for the games played; returning a zeroed report would
+// throw that away and print an empty summary.
+func TestInterruptedGateStillReports(t *testing.T) {
+	cfg := testMatchConfig()
+	cfg.MaxGames = 10000
+	// Cheap games: this test is about what a stopped run reports, not about
+	// how well anything plays, and it pays for a calibration run as well.
+	cfg.NodesPerMove = 120
+	cfg.MaxPlies = 40
+
+	g, err := New(DefaultSPRT(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The cancellation is triggered by work done rather than by elapsed time.
+	// A wall-clock timeout would make this test a race against the machine —
+	// and under the race detector, which is several times slower, it would
+	// cancel before a single pair finished and assert nothing.
+	//
+	// Because the match is deterministic, counting evaluations is exact: a
+	// calibration run measures what two pairs cost, and cancelling at that
+	// count in a longer run lands in the third pair every time, on any machine.
+	calibration := &countingEval{inner: eval.NewHCE()}
+	warmup, err := New(DefaultSPRT(), func() MatchConfig { c := cfg; c.MaxGames = 4; return c }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := warmup.Test(context.Background(), calibration, calibration); err != nil {
+		t.Fatal(err)
+	}
+	twoPairs := calibration.count()
+	if twoPairs == 0 {
+		t.Fatal("the calibration run evaluated nothing")
+	}
+
+	// Two equal evaluations, so the test never concludes on its own and the
+	// cancellation is what stops it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &countingEval{inner: eval.NewHCE(), limit: twoPairs, cancel: cancel}
+	report, err := g.Test(ctx, e, e)
+	if err == nil {
+		t.Fatal("expected the cancellation to be reported")
+	}
+
+	if report.Games == 0 {
+		t.Fatal("no games completed before cancellation; the test cannot check what it means to")
+	}
+	if report.Reason == "" {
+		t.Error("an interrupted run produced no explanation")
+	}
+	if report.Duration == 0 {
+		t.Error("an interrupted run reported no duration")
+	}
+	if report.LOS == 0 {
+		t.Error("an interrupted run reported no likelihood of superiority")
+	}
+	if report.Promoted() {
+		t.Error("an interrupted run counted as a promotion")
+	}
+	if !strings.Contains(report.Reason, "stopped") {
+		t.Errorf("the explanation does not say the run was cut short: %q", report.Reason)
+	}
+	// The point of the report is the numbers it carries; "+Inf" is not one.
+	if strings.Contains(report.Reason, "Inf") {
+		t.Errorf("the explanation printed an infinity rather than describing it: %q", report.Reason)
+	}
+	t.Logf("%s", report.Reason)
+}
+
+// TestExplainDescribesUnboundedElo covers the formatting of results too
+// one-sided to put a number on, which is the common case for a match that ends
+// after four games.
+func TestExplainDescribesUnboundedElo(t *testing.T) {
+	g, err := New(DefaultSPRT(), testMatchConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		report  Report
+		wantSub string
+	}{
+		{
+			"a clean sweep has no finite Elo",
+			Report{Verdict: Accept, Wins: 4, EloDelta: math.Inf(1), EloMargin: math.Inf(1)},
+			"unbounded",
+		},
+		{
+			"a finite estimate with an unbounded interval",
+			Report{Verdict: Accept, Wins: 3, Draws: 1, EloDelta: 120, EloMargin: math.Inf(1)},
+			"margin unbounded",
+		},
+		{
+			"both finite",
+			Report{Verdict: Reject, Wins: 40, Losses: 60, EloDelta: -70, EloMargin: 55},
+			"-70.0 +/- 55.0 Elo",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := g.explain(tc.report, nil)
+			if !strings.Contains(got, tc.wantSub) {
+				t.Errorf("explanation %q does not contain %q", got, tc.wantSub)
+			}
+			if strings.Contains(got, "Inf") {
+				t.Errorf("explanation printed an infinity: %q", got)
+			}
+		})
 	}
 }
 

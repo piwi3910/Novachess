@@ -84,9 +84,24 @@ func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (R
 	start := time.Now()
 	pairs := g.match.MaxGames / 2
 
+	// The report is finished on every exit path, including an interrupted one.
+	// A run stopped after four hundred games knows something worth reporting,
+	// and returning a zeroed report would throw that away — and would print an
+	// empty summary from a caller that had every reason to expect a partial
+	// one. The verdict on such a run is whatever the evidence supported when it
+	// stopped, which for an interruption is normally inconclusive, and so not a
+	// promotion.
+	finish := func(err error) (Report, error) {
+		report.EloDelta, report.EloMargin = Elo(report.Wins, report.Losses, report.Draws)
+		report.LOS = LOS(report.Wins, report.Losses)
+		report.Duration = time.Since(start)
+		report.Reason = g.explain(report, err)
+		return report, err
+	}
+
 	for pair := 0; pair < pairs; pair++ {
-		if ctx.Err() != nil {
-			return report, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return finish(err)
 		}
 
 		// One pair at a time, reusing the match runner so that a gated match
@@ -101,7 +116,7 @@ func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (R
 
 		result, err := RunMatch(ctx, candidate, incumbent, cfg)
 		if err != nil {
-			return report, err
+			return finish(err)
 		}
 
 		report.Wins += result.Wins
@@ -118,20 +133,28 @@ func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (R
 		}
 	}
 
-	report.EloDelta, report.EloMargin = Elo(report.Wins, report.Losses, report.Draws)
-	report.LOS = LOS(report.Wins, report.Losses)
-	report.Duration = time.Since(start)
-	report.Reason = g.explain(report)
-
-	return report, nil
+	return finish(nil)
 }
 
 // explain puts the decision into a sentence, including the numbers that would
 // otherwise have to be recovered from the fields to understand it.
-func (g *Gate) explain(r Report) string {
+func (g *Gate) explain(r Report, err error) string {
+	// A clean sweep has unbounded Elo, and so does a confidence interval whose
+	// upper end reaches a perfect score — which happens readily on the handful
+	// of games a decisive match takes. Both are described in words rather than
+	// printed as "+Inf", which reads like a number and is not one.
 	elo := "unbounded"
-	if !math.IsInf(r.EloDelta, 0) {
+	switch {
+	case math.IsInf(r.EloDelta, 0):
+	case math.IsInf(r.EloMargin, 0):
+		elo = fmt.Sprintf("%+.1f Elo, margin unbounded", r.EloDelta)
+	default:
 		elo = fmt.Sprintf("%+.1f +/- %.1f Elo", r.EloDelta, r.EloMargin)
+	}
+
+	if err != nil {
+		return fmt.Sprintf("stopped after %d games (%v): %s, LLR %.2f (+%v/-%v/=%v)",
+			r.Games, err, elo, r.LLR, r.Wins, r.Losses, r.Draws)
 	}
 
 	switch r.Verdict {
