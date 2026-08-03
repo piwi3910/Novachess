@@ -82,7 +82,11 @@ type Searcher struct {
 	evaluator eval.Evaluator
 	stopped   atomic.Bool
 
-	threads int
+	// threads is atomic because SetThreads may be called from a different
+	// goroutine than the one searching. The UCI layer stops the search first,
+	// but the package API does not require callers to, and an unsynchronized
+	// read here would be a data race rather than merely a stale value.
+	threads atomic.Int32
 	// totalNodes aggregates every thread's node count so that progress reports
 	// describe the whole search rather than one thread's share.
 	totalNodes atomic.Uint64
@@ -91,11 +95,12 @@ type Searcher struct {
 // New returns a searcher with a table of the given size in megabytes, searching
 // on a single thread.
 func New(evaluator eval.Evaluator, hashMB int) *Searcher {
-	return &Searcher{
+	s := &Searcher{
 		tt:        NewTT(hashMB),
 		evaluator: evaluator,
-		threads:   1,
 	}
+	s.threads.Store(1)
+	return s
 }
 
 // SetThreads sets how many threads a search uses.
@@ -118,11 +123,11 @@ func (s *Searcher) SetThreads(n int) {
 	if n > MaxThreads {
 		n = MaxThreads
 	}
-	s.threads = n
+	s.threads.Store(int32(n))
 }
 
 // Threads reports the configured thread count.
-func (s *Searcher) Threads() int { return s.threads }
+func (s *Searcher) Threads() int { return int(s.threads.Load()) }
 
 // MaxThreads bounds the thread count. Each thread holds its own search state of
 // a few hundred kilobytes, so the limit is about memory rather than usefulness.
@@ -223,8 +228,9 @@ func (s *Searcher) Search(ctx context.Context, pos *chess.Position, limits Limit
 	// entries they leave behind, which deepen and improve the main thread's
 	// search. This is lazy SMP: no work is partitioned and no thread waits for
 	// another.
+	threads := s.Threads()
 	var wg sync.WaitGroup
-	for id := 1; id < s.threads; id++ {
+	for id := 1; id < threads; id++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
@@ -275,9 +281,14 @@ func (st *state) iterate(limits Limits, maxDepth int, soft time.Duration, start 
 		if st.pvLength[0] > 1 {
 			result.Ponder = st.pv[0][1]
 		}
-		result.Info = st.info(depth, score, time.Since(start))
-		if onInfo != nil {
-			onInfo(result.Info)
+		// Only the reporting thread builds Info. It samples the table for
+		// occupancy and allocates the principal variation, none of which a
+		// helper's discarded result needs.
+		if st.threadID == 0 {
+			result.Info = st.info(depth, score, time.Since(start))
+			if onInfo != nil {
+				onInfo(result.Info)
+			}
 		}
 
 		if eval.IsMateScore(score) && !limits.Infinite {
