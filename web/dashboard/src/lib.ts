@@ -21,3 +21,18 @@ export function parseEpochLine(line: string): { epoch: number; loss: number } | 
 export function fmtNps(nps: number): string {
   return nps >= 1e6 ? (nps / 1e6).toFixed(2) + "M" : Math.round(nps / 1e3) + "k";
 }
+
+// One line of truth about whether self-play is running, fed by the replica
+// counts the server includes in every state frame. Error strings from the
+// server pass through verbatim rather than being dressed up as a status.
+export function selfplayStatus(
+  workers: number | string | undefined,
+  coordinator: number | string | undefined,
+): string {
+  if (workers === undefined || coordinator === undefined) return "";
+  if (typeof workers === "string") return workers;
+  if (typeof coordinator === "string") return coordinator;
+  if (workers === 0 && coordinator === 0) return "self-play paused";
+  const coord = coordinator > 0 ? "coordinator running" : "coordinator parked";
+  return `${workers} worker${workers === 1 ? "" : "s"} · ${coord}`;
+}

@@ -18,7 +18,7 @@ export interface GenProgress {
 export interface Snapshot {
   boards: Board[];
   generation: GenProgress;
-  selfplay?: { workers: number; coordinator: number };
+  selfplay?: { workers: number | string; coordinator: number | string };
 }
 export interface HistoryRecord {
   type: "dataset" | "training" | "gate" | "promotion";
