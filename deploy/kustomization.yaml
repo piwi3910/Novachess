@@ -9,6 +9,7 @@ resources:
   - nats.yaml
   - worker.yaml
   - coordinator.yaml
+  - dashboard.yaml
   - jobs.yaml
 
 # Point this at your registry once the image is pushed.

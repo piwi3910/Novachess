@@ -1,0 +1,121 @@
+# The training dashboard: read-mostly, plus the operator controls that were
+# previously kubectl commands and YAML edits.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: novachess-dashboard
+  namespace: novachess
+---
+# Everything the dashboard may do, and nothing else. Notably absent: any
+# write on pods, any access outside the namespace, and any verb on the
+# worker Deployment beyond scaling. The coordinator env patch is what
+# advances a generation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: novachess-dashboard
+  namespace: novachess
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: novachess-dashboard
+  namespace: novachess
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: novachess-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: novachess-dashboard
+    namespace: novachess
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: novachess-dashboard
+  namespace: novachess
+  labels:
+    app: novachess-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: novachess-dashboard
+  template:
+    metadata:
+      labels:
+        app: novachess-dashboard
+    spec:
+      serviceAccountName: novachess-dashboard
+      containers:
+        - name: dashboard
+          image: novachess:dev
+          command: ["/usr/local/bin/dashboard"]
+          env:
+            - name: NOVA_BUS_URLS
+              value: "nats://nova-nats:4222"
+            - name: NOVA_DATA_DIR
+              value: "/data"
+            - name: NOVA_NAMESPACE
+              value: "novachess"
+            - name: NOVA_WORKER_REPLICAS
+              value: "8"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: novachess-data
+---
+# LoadBalancer so the dashboard has a stable LAN address. No auth by
+# decision: the LAN is the trust boundary here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: novachess-dashboard
+  namespace: novachess
+  labels:
+    app: novachess-dashboard
+spec:
+  type: LoadBalancer
+  selector:
+    app: novachess-dashboard
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
