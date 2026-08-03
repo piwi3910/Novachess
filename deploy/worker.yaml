@@ -1,0 +1,73 @@
+# Self-play workers. This is where the boards spend their time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: novachess-worker
+  namespace: novachess
+  labels:
+    app: novachess-worker
+spec:
+  # One per board to start. Scale this rather than giving a worker more search
+  # threads: a fixed-node search is deterministic at one thread and not at two,
+  # and the pipeline replays work units on different boards expecting identical
+  # games.
+  replicas: 8
+  selector:
+    matchLabels:
+      app: novachess-worker
+  template:
+    metadata:
+      labels:
+        app: novachess-worker
+    spec:
+      # Spread across boards rather than stacking on whichever has room.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: novachess-worker
+      # A worker holds one unit at a time and returns it to the queue on
+      # shutdown, so it needs long enough to notice the signal, not long enough
+      # to finish the unit.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: novachess:dev
+          command: ["/usr/local/bin/selfplay-worker"]
+          env:
+            - name: NOVA_BUS_URLS
+              value: "nats://nova-nats:4222"
+            - name: NOVA_DATA_DIR
+              value: "/data"
+            - name: NOVA_HASH_MB
+              value: "64"
+            - name: NOVA_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NOVA_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              # One core, because one worker searches on one thread. Raising
+              # this does not make it faster.
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: novachess-data

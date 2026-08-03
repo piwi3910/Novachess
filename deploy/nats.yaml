@@ -1,0 +1,95 @@
+# NATS with JetStream, single node.
+#
+# One replica is right for this workload: the pipeline exchanges tens of
+# messages per second, and a three-node cluster would spend memory on
+# replication that the boards would rather spend on search. Work survives a
+# restart because JetStream writes to disk, which is what actually matters here
+# — a broker being briefly unavailable delays the loop, it does not lose it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nova-nats-config
+  namespace: novachess
+data:
+  nats.conf: |
+    port: 4222
+    http: 8222
+    jetstream {
+      store_dir: /data
+      max_memory_store: 256MB
+      max_file_store: 8GB
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nova-nats
+  namespace: novachess
+spec:
+  selector:
+    app: nova-nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nova-nats
+  namespace: novachess
+spec:
+  serviceName: nova-nats
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nova-nats
+  template:
+    metadata:
+      labels:
+        app: nova-nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2-alpine
+          args: ["-c", "/etc/nats/nats.conf"]
+          ports:
+            - containerPort: 4222
+            - containerPort: 8222
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: nova-nats-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: longhorn
+        resources:
+          requests:
+            storage: 10Gi

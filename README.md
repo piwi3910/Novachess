@@ -5,11 +5,13 @@ self-play training pipeline designed to run distributed across a cluster.
 
 ## Status
 
-Under construction. The learning loop closes and is self-correcting: self-play
-generates labelled positions, the trainer fits a network to them, the gatekeeper
-makes each candidate win a match before it replaces the incumbent, and the
-engine plays with whatever was promoted. What remains is the services that run
-the loop unattended across a cluster.
+The learning loop closes, is self-correcting, and runs distributed: self-play
+workers generate labelled positions across a cluster, the trainer fits a network
+to them, the gatekeeper makes each candidate win a match before it replaces the
+incumbent, and the engine plays with whatever was promoted.
+
+See [deploy/](deploy/) for the Kubernetes manifests. What remains is automating
+the hand-off between generations, which currently has an operator in it.
 
 | Component | State |
 |---|---|
@@ -28,7 +30,8 @@ the loop unattended across a cluster.
 | Gatekeeper (SPRT match gating) | done |
 | Artifact storage | done |
 | Message bus, NATS with JetStream | done |
-| Pipeline services (coordinator, worker) | not started |
+| Pipeline services (coordinator, worker) | done |
+| Kubernetes manifests | done |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
 GUI or match runner can load.
@@ -102,8 +105,8 @@ around the engine, not pieces of it.
 ```
 cmd/novachess/          UCI engine binary
 cmd/novabot/            Lichess bot binary
-cmd/coordinator/        work distribution and dataset assembly
-cmd/selfplay-worker/    game generation
+cmd/coordinator/        work distribution and dataset assembly (implemented)
+cmd/selfplay-worker/    game generation (implemented)
 cmd/trainer/            network training (implemented)
 cmd/gatekeeper/         SPRT gating (implemented)
 
@@ -114,6 +117,9 @@ internal/uci/           UCI protocol
 internal/lichess/       Lichess Bot API client
 internal/gate/          SPRT, match running, promotion decisions
 internal/store/         artifact storage for batches and networks
+internal/worker/        the self-play worker's run loop
+internal/coordinator/   generation state, work issuing, dataset assembly
+internal/pipeline/      end-to-end test of the whole loop
 internal/nnue/          trained evaluation: network, accumulator, inference
 internal/train/         self-play generation, packed data format, optimizer
 
@@ -457,7 +463,46 @@ sits under the root is defeated by a symlink planted inside the store: the
 string comparison happens long before the kernel resolves the link. Nothing in
 this package creates symlinks, but anything else with access to the volume can.
 
+## Running the pipeline
+
+The loop is four services around one shared volume and one broker. See
+[deploy/](deploy/) for Kubernetes manifests; the whole thing is
+`kubectl apply -k deploy/` once an image is pushed and a ReadWriteMany storage
+class exists.
+
+**The coordinator** issues work units, counts the batches that come back, and
+announces a dataset once a generation has enough positions. There is exactly one
+of it — two would each count half the batches and neither would reach its
+target, which is a deadlock with no error anywhere. Its Deployment uses
+`Recreate` rather than `RollingUpdate` for that reason.
+
+**Workers** take one unit at a time, play the games, store the positions and
+announce the batch. Scaling means running more of them. Each searches on one
+thread, which is a correctness requirement rather than a tuning choice: a
+replayed unit has to produce identical games, and lazy SMP is non-deterministic
+by construction.
+
+Two orderings hold the loop together:
+
+- A worker stores its batch and gets the announcement acknowledged by the broker
+  **before** acknowledging the unit. Acknowledging earlier would mean a crash in
+  the gap loses the games silently — the unit gone from the queue with no
+  artifact to show for it.
+- The coordinator **verifies an artifact's checksum before counting it**. A
+  worker announces a batch it believes it stored; if it is missing or corrupt,
+  counting it would build a dataset around data the trainer cannot read, and the
+  failure would surface much later as an error nobody could trace back.
+
+At-least-once delivery means a unit can be played twice. That is safe because
+generation is deterministic: a replayed unit overwrites its own artifact with
+byte-identical data, and the coordinator deduplicates the announcement.
+
+Generation zero needs nothing to exist first. There is no network yet, so
+workers bootstrap from the hand-crafted evaluation — which is the only reason
+the loop can start at all.
+
 ## Running
+
 
 ```
 go build ./cmd/novachess

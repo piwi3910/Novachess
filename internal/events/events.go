@@ -141,6 +141,13 @@ type GameBatch struct {
 	Positions int   `json:"positions"`
 	Games     int   `json:"games"`
 
+	// Checksum is the SHA-256 of the artifact, hex encoded, so the coordinator
+	// can prove it is counting the data the worker actually wrote. Corruption
+	// between the two is the failure nothing downstream can detect: a dataset
+	// assembled from unverified batches trains a network from whatever the
+	// disks happened to return.
+	Checksum string `json:"checksum,omitempty"`
+
 	// NodesPerSecond is the worker's measured search throughput. Reporting it
 	// per batch is what makes thermal throttling visible in the data rather
 	// than a thing to infer from wall-clock times.

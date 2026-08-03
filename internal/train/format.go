@@ -28,6 +28,11 @@ const FormatVersion uint32 = 1
 // RecordSize is the fixed size of one packed sample.
 const RecordSize = 32
 
+// FileExtension is what a data file is called. The trainer uses it to find a
+// generation's batches when given a directory, which is how a Kubernetes Job
+// names them: the runtime image has no shell to expand a glob with.
+const FileExtension = ".novadata"
+
 // Result is a game outcome, always from White's point of view.
 type Result int8
 

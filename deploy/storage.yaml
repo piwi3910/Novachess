@@ -1,0 +1,21 @@
+# The shared volume every service reads and writes.
+#
+# ReadWriteMany is not optional. Workers write batches from whichever board
+# scheduled them and the trainer reads all of them from another, so a
+# ReadWriteOnce volume would give each pod its own view: every write would
+# succeed, every read would return a fraction of the data, and nothing would
+# report a problem. Longhorn provides RWX through its share-manager.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: novachess-data
+  namespace: novachess
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      # A generation of a million positions is about 32MB of packed records, so
+      # this holds many generations plus the networks trained from them.
+      storage: 100Gi

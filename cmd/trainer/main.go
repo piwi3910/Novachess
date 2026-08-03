@@ -60,8 +60,11 @@ func main() {
 	// Inputs are sorted so that a shell glob's order, which depends on the
 	// locale, cannot change the result. Determinism is the point of the seed
 	// and it would be undone by reading the same files in a different order.
-	inputs := append([]string(nil), flag.Args()...)
-	sort.Strings(inputs)
+	inputs, err := expand(flag.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "trainer:", err)
+		os.Exit(1)
+	}
 
 	samples, err := readAll(inputs)
 	if err != nil {
@@ -86,6 +89,44 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
+}
+
+// expand turns the given paths into a sorted list of data files.
+//
+// A directory becomes every .novadata file inside it. That is not a
+// convenience: the runtime image has no shell, so a Kubernetes Job cannot
+// expand a glob, and a generation's batches are one file per work unit — a
+// command line naming them individually would be thousands of arguments long.
+//
+// The result is sorted so that the order does not depend on the filesystem's
+// directory ordering, which would otherwise make an otherwise-reproducible run
+// differ between machines.
+func expand(paths []string) ([]string, error) {
+	var files []string
+
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+
+		if !info.IsDir() {
+			files = append(files, path)
+			continue
+		}
+
+		matches, err := filepath.Glob(filepath.Join(path, "*"+train.FileExtension))
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("%s holds no %s files", path, train.FileExtension)
+		}
+		files = append(files, matches...)
+	}
+
+	sort.Strings(files)
+	return files, nil
 }
 
 // readAll loads every input file.
@@ -157,7 +198,14 @@ func write(path string, net interface {
 	WriteTo(io.Writer) (int64, error)
 },
 ) error {
+	// The directory may not exist yet: on a fresh volume the first generation
+	// is the first thing to write a network, and a Job failing on a missing
+	// parent directory is a poor way to find that out.
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
 	tmp, err := os.CreateTemp(dir, ".network-*.tmp")
 	if err != nil {
 		return err
