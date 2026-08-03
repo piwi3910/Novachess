@@ -83,7 +83,12 @@ type NATS struct {
 	// unit repeatedly while the first worker was still playing it.
 	ackWait time.Duration
 
-	// maxInFlight caps unacknowledged messages per consumer.
+	// durable names this service's consumer for fan-out subscriptions, so its
+	// position survives a restart. Empty means ephemeral.
+	durable string
+
+	// maxInFlight caps unacknowledged messages per consumer — which for a queue
+	// group means across the whole group, since its members share one consumer.
 	maxInFlight int
 
 	mu   sync.Mutex
@@ -99,6 +104,27 @@ const DialTimeout = 10 * time.Second
 // by design: redelivering a unit that is still being played wastes a whole
 // worker's time on a duplicate.
 const DefaultAckWait = 30 * time.Minute
+
+// DefaultMaxInFlight is the ceiling on unacknowledged messages.
+//
+// This is a group-wide limit, not a per-worker one: the members of a queue
+// group share a single consumer, and the server enforces MaxAckPending against
+// that consumer. Setting it to the number of units a worker should hold — one —
+// throttles the entire cluster to one unit at a time, so adding boards does
+// nothing at all. The failure is silent; throughput simply never improves.
+//
+// So it is set well above any plausible worker count, and the "one unit at a
+// time" property is enforced where it actually belongs: on how many messages
+// each subscriber buffers.
+const DefaultMaxInFlight = 512
+
+// prefetch is how many messages a single subscriber buffers.
+//
+// One, so a worker takes a unit only when it is ready to play it. The client
+// default is 500, which would let the first worker to connect pull hundreds of
+// units into memory while its peers sat idle — units that are minutes of games
+// each, so the imbalance would last for hours.
+const prefetch = 1
 
 // Connect opens a bus against a NATS server and ensures the stream exists.
 func Connect(ctx context.Context, cfg Config) (*NATS, error) {
@@ -169,9 +195,7 @@ func Connect(ctx context.Context, cfg Config) (*NATS, error) {
 
 	inFlight := cfg.MaxInFlight
 	if inFlight <= 0 {
-		// One. A worker holding several unstarted units while idle peers wait
-		// is exactly the imbalance a queue group exists to prevent.
-		inFlight = 1
+		inFlight = DefaultMaxInFlight
 	}
 
 	return &NATS{
@@ -181,6 +205,7 @@ func Connect(ctx context.Context, cfg Config) (*NATS, error) {
 		facts:       facts,
 		producer:    name,
 		ackWait:     DefaultAckWait,
+		durable:     cfg.Durable,
 		maxInFlight: inFlight,
 	}, nil
 }
@@ -305,14 +330,17 @@ func (n *NATS) subscribe(ctx context.Context, subject, queue string, h Handler) 
 	if !IsDurable(subject) {
 		var err error
 		if queue == "" {
-			sub.core, err = n.conn.Subscribe(subject, n.coreHandler(h))
+			sub.core, err = n.conn.Subscribe(subject, n.coreHandler(ctx, h))
 		} else {
-			sub.core, err = n.conn.QueueSubscribe(subject, queue, n.coreHandler(h))
+			sub.core, err = n.conn.QueueSubscribe(subject, queue, n.coreHandler(ctx, h))
 		}
 		if err != nil {
 			return nil, fmt.Errorf("bus: subscribing to %s: %w", subject, err)
 		}
-		n.track(sub)
+		if err := n.track(sub); err != nil {
+			sub.stop()
+			return nil, err
+		}
 		return sub, nil
 	}
 
@@ -322,11 +350,18 @@ func (n *NATS) subscribe(ctx context.Context, subject, queue string, h Handler) 
 		AckWait:       n.ackWait,
 		MaxAckPending: n.maxInFlight,
 	}
-	if queue != "" {
+	switch {
+	case queue != "":
 		// A named durable consumer shared by the group. Its position in the
 		// stream survives restarts, so a worker coming back does not replay
 		// units the group already finished.
 		cfg.Durable = consumerName(queue)
+	case n.durable != "":
+		// A fan-out consumer belonging to this service alone, named so that it
+		// resumes rather than starting from the present. The subject is part of
+		// the name because one service may subscribe to several, and a single
+		// consumer cannot filter for all of them.
+		cfg.Durable = consumerName(n.durable + "-" + subject)
 	}
 
 	consumer, err := n.streamFor(subject).CreateOrUpdateConsumer(ctx, cfg)
@@ -334,13 +369,16 @@ func (n *NATS) subscribe(ctx context.Context, subject, queue string, h Handler) 
 		return nil, fmt.Errorf("bus: creating a consumer for %s: %w", subject, err)
 	}
 
-	consume, err := consumer.Consume(n.streamHandler(h))
+	consume, err := consumer.Consume(n.streamHandler(ctx, h), jetstream.PullMaxMessages(prefetch))
 	if err != nil {
 		return nil, fmt.Errorf("bus: consuming %s: %w", subject, err)
 	}
 	sub.consume = consume
 
-	n.track(sub)
+	if err := n.track(sub); err != nil {
+		sub.stop()
+		return nil, err
+	}
 	return sub, nil
 }
 
@@ -355,19 +393,19 @@ func consumerName(queue string) string {
 // There is no acknowledgement to give, so a handler that fails has nowhere to
 // report it: core NATS is fire-and-forget and the message is already gone.
 // That is exactly why work never travels this way, and why only heartbeats do.
-func (n *NATS) coreHandler(h Handler) nats.MsgHandler {
+func (n *NATS) coreHandler(ctx context.Context, h Handler) nats.MsgHandler {
 	return func(msg *nats.Msg) {
 		var env events.Envelope
 		if err := json.Unmarshal(msg.Data, &env); err != nil {
 			return
 		}
-		_ = h(context.Background(), env)
+		_ = h(ctx, env)
 	}
 }
 
 // streamHandler adapts a handler to a JetStream consumer, translating its
 // return into an acknowledgement.
-func (n *NATS) streamHandler(h Handler) jetstream.MessageHandler {
+func (n *NATS) streamHandler(ctx context.Context, h Handler) jetstream.MessageHandler {
 	return func(msg jetstream.Msg) {
 		var env events.Envelope
 		if err := json.Unmarshal(msg.Data(), &env); err != nil {
@@ -378,7 +416,7 @@ func (n *NATS) streamHandler(h Handler) jetstream.MessageHandler {
 			return
 		}
 
-		if err := h(context.Background(), env); err != nil {
+		if err := h(ctx, env); err != nil {
 			// Negative acknowledgement, so another worker gets it. This is the
 			// at-least-once behaviour handlers are required to tolerate.
 			_ = msg.Nak()
@@ -388,10 +426,21 @@ func (n *NATS) streamHandler(h Handler) jetstream.MessageHandler {
 	}
 }
 
-func (n *NATS) track(sub *natsSub) {
+// track registers a subscription, refusing if the bus closed while it was
+// being set up.
+//
+// Subscribing releases the lock to make network calls, so a Close can land in
+// the middle. Without this check the new subscription would be created after
+// Close captured the list, leaving it delivering messages to a handler whose
+// service believes it has shut down.
+func (n *NATS) track(sub *natsSub) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.closed {
+		return ErrClosed
+	}
 	n.subs = append(n.subs, sub)
+	return nil
 }
 
 // Close stops every subscription and closes the connection.

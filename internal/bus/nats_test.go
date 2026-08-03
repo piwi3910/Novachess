@@ -526,3 +526,200 @@ func TestBothBusesSatisfyTheInterface(t *testing.T) {
 	var _ Bus = (*Memory)(nil)
 	var _ Bus = (*NATS)(nil)
 }
+
+// TestNATSQueueGroupRunsWorkersConcurrently is the property that makes adding
+// boards do anything.
+//
+// A queue group shares one consumer, so the server's MaxAckPending is a ceiling
+// on the whole group rather than on each member. Set to one, the entire cluster
+// plays one unit at a time however many workers are running — the throughput of
+// a single board, with the electricity bill of eight. Nothing about that is
+// visible in a log; it just never gets faster.
+//
+// Each handler here blocks until every worker has a unit, so the test can only
+// pass if they genuinely run at once.
+func TestNATSQueueGroupRunsWorkersConcurrently(t *testing.T) {
+	// Deliberately the defaults: a deployment that sets nothing must still
+	// scale, because the failure is invisible and the fix is not discoverable
+	// from any symptom.
+	ctx := context.Background()
+	b, err := Connect(ctx, Config{URLs: []string{runBroker(t)}, ClientName: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	const workers = 4
+
+	var mu sync.Mutex
+	inFlight := 0
+	allBusy := make(chan struct{})
+	release := make(chan struct{})
+
+	for i := 0; i < workers; i++ {
+		sub, subErr := b.QueueSubscribe(ctx, events.SubjectWorkAssign, "selfplay", func(context.Context, events.Envelope) error {
+			mu.Lock()
+			inFlight++
+			if inFlight == workers {
+				close(allBusy)
+			}
+			mu.Unlock()
+
+			// Hold the unit, as a worker playing games would.
+			<-release
+			return nil
+		})
+		if subErr != nil {
+			t.Fatal(subErr)
+		}
+		defer sub.Close()
+	}
+
+	for i := 0; i < workers; i++ {
+		if err := b.Publish(ctx, events.SubjectWorkAssign, events.WorkUnit{ID: fmt.Sprintf("unit-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case <-allBusy:
+	case <-time.After(20 * time.Second):
+		mu.Lock()
+		got := inFlight
+		mu.Unlock()
+		close(release)
+		t.Fatalf("only %d of %d workers held a unit at once; the group is throttled to that many in flight", got, workers)
+	}
+	close(release)
+}
+
+// TestDurableFanOutResumesAfterRestart checks what Config.Durable now buys.
+//
+// A service subscribing to a fan-out subject ephemerally starts from the
+// present, so anything published while it was being rescheduled is lost to it.
+// For a promotion that means a worker carrying on with a network the gatekeeper
+// already replaced, and nothing anywhere reports it. With a durable name the
+// consumer resumes where it left off.
+func TestDurableFanOutResumesAfterRestart(t *testing.T) {
+	url := runBroker(t)
+	ctx := context.Background()
+
+	open := func(durable string) *NATS {
+		b, err := Connect(ctx, Config{URLs: []string{url}, ClientName: "coordinator", Durable: durable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	// A service that has seen the subject before, so its consumer exists.
+	first := open("coordinator")
+	var before atomic.Int32
+	sub, err := first.Subscribe(ctx, events.SubjectNetPromoted, func(context.Context, events.Envelope) error {
+		before.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Publish(ctx, events.SubjectNetPromoted, events.NetworkVerdict{Generation: 1, Promoted: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first promotion", func() bool { return before.Load() == 1 })
+
+	// The service goes away.
+	sub.Close()
+	first.Close()
+
+	// A promotion happens while it is down.
+	publisher := open("")
+	defer publisher.Close()
+	if err := publisher.Publish(ctx, events.SubjectNetPromoted, events.NetworkVerdict{Generation: 2, Promoted: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// It comes back under the same durable name and must learn about it.
+	second := open("coordinator")
+	defer second.Close()
+
+	var after atomic.Int32
+	sub2, err := second.Subscribe(ctx, events.SubjectNetPromoted, func(context.Context, events.Envelope) error {
+		after.Add(1)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub2.Close()
+
+	waitFor(t, "the promotion missed while the service was down", func() bool { return after.Load() >= 1 })
+}
+
+// TestSubscribeAfterCloseDoesNotLeak covers the race between setting a
+// subscription up and closing the bus. Subscribing releases the lock to make
+// network calls, so a Close can land in the middle — and a subscription created
+// after Close captured its list would keep delivering to a service that
+// believes it has shut down.
+func TestSubscribeAfterCloseDoesNotLeak(t *testing.T) {
+	b := connect(t, runBroker(t), "test")
+	ctx := context.Background()
+
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		call func() (Subscription, error)
+	}{
+		{"fan-out", func() (Subscription, error) {
+			return b.Subscribe(ctx, events.SubjectNetPromoted, func(context.Context, events.Envelope) error { return nil })
+		}},
+		{"queue", func() (Subscription, error) {
+			return b.QueueSubscribe(ctx, events.SubjectWorkAssign, "selfplay", func(context.Context, events.Envelope) error { return nil })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub, err := tc.call()
+			if err != ErrClosed {
+				t.Errorf("got %v, want ErrClosed", err)
+			}
+			if sub != nil {
+				t.Error("a subscription was returned by a closed bus")
+			}
+		})
+	}
+}
+
+// TestHandlerReceivesTheSubscriptionContext checks that a handler is given the
+// context its subscription was created with rather than a detached one, so a
+// service shutting down reaches the code doing the work.
+func TestHandlerReceivesTheSubscriptionContext(t *testing.T) {
+	b := connect(t, runBroker(t), "test")
+
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "carried")
+
+	got := make(chan any, 1)
+	sub, err := b.QueueSubscribe(ctx, events.SubjectWorkAssign, "selfplay", func(c context.Context, _ events.Envelope) error {
+		got <- c.Value(key{})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := b.Publish(ctx, events.SubjectWorkAssign, events.WorkUnit{ID: "ctx"}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case v := <-got:
+		if v != "carried" {
+			t.Errorf("the handler's context carried %v; it is not the subscription's", v)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("no message arrived")
+	}
+}
