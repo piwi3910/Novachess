@@ -157,15 +157,31 @@ func (c *k8sCluster) Job(ctx context.Context, name string) (JobState, error) {
 		t := j.Status.StartTime.Time
 		out.StartedAt = &t
 	}
-	// The gatekeeper's exit code is the verdict; dig it out of the pod.
+	// The gatekeeper's exit code is the verdict, so a failure to list its
+	// pods must be surfaced rather than silently read as "not decided yet".
 	pods, err := c.cs.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{LabelSelector: "job-name=" + name})
-	if err == nil {
-		for _, p := range pods.Items {
-			for _, st := range p.Status.ContainerStatuses {
-				if st.State.Terminated != nil {
-					code := st.State.Terminated.ExitCode
-					out.ExitCode = &code
-				}
+	if err != nil {
+		return out, err
+	}
+	// Under retries (backoffLimit > 0) more than one pod can exist for the
+	// job. The verdict is whichever pod ran most recently, not whichever
+	// happens to sort first in the list - so track the newest terminated
+	// container seen, using pod start time (falling back to creation time
+	// for pods that never got scheduled) to break ties.
+	var newest *metav1.Time
+	for _, p := range pods.Items {
+		podTime := p.Status.StartTime
+		if podTime == nil {
+			podTime = &p.CreationTimestamp
+		}
+		for _, st := range p.Status.ContainerStatuses {
+			if st.State.Terminated == nil {
+				continue
+			}
+			if newest == nil || podTime.After(newest.Time) {
+				code := st.State.Terminated.ExitCode
+				out.ExitCode = &code
+				newest = podTime
 			}
 		}
 	}
