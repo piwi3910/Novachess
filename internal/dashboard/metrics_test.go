@@ -34,6 +34,21 @@ func TestBoardWithoutSampleOmitsMetrics(t *testing.T) {
 	}
 }
 
+func TestHeartbeatPreservesMetricsAcrossInterleaving(t *testing.T) {
+	s := NewState()
+	s.NoteHeartbeat(events.WorkerHeartbeat{WorkerID: "pod-a"}, time.Now())
+	s.NoteMetrics(map[string]PodMetrics{
+		"pod-a": {CPUMillicores: 970, MemoryBytes: 200 << 20},
+	})
+	// A later heartbeat (the ordinary steady-state interleaving of the two
+	// ~15s cadences) must not zero out the sample the poller already joined.
+	s.NoteHeartbeat(events.WorkerHeartbeat{WorkerID: "pod-a"}, time.Now())
+	b := s.Snapshot(time.Now()).Boards[0]
+	if b.CPUMillicores != 970 || b.MemoryBytes != 200<<20 {
+		t.Fatalf("heartbeat wiped metrics carried from a prior sample: %+v", b)
+	}
+}
+
 func TestMetricsPollerFeedsState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

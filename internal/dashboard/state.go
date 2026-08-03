@@ -84,6 +84,12 @@ func (s *State) SetTarget(target int) {
 
 func (s *State) NoteHeartbeat(hb events.WorkerHeartbeat, at time.Time) {
 	s.mu.Lock()
+	// Carry the metrics fields forward from any existing entry: heartbeats
+	// and metrics polls both land on ~15s cadences and interleave in
+	// whichever order they happen to arrive, so replacing the whole struct
+	// here would blink the cards' CPU/memory to zero roughly every other
+	// heartbeat instead of only once, before the first sample ever arrives.
+	existing := s.boards[hb.WorkerID]
 	s.boards[hb.WorkerID] = Board{
 		WorkerID:       hb.WorkerID,
 		NodeName:       hb.NodeName,
@@ -92,6 +98,8 @@ func (s *State) NoteHeartbeat(hb events.WorkerHeartbeat, at time.Time) {
 		NodesPerSecond: hb.NodesPerSecond,
 		GamesCompleted: hb.GamesCompleted,
 		LastSeen:       at,
+		CPUMillicores:  existing.CPUMillicores,
+		MemoryBytes:    existing.MemoryBytes,
 	}
 	s.mu.Unlock()
 	s.notify()
