@@ -78,7 +78,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := &http.Server{Addr: addr, Handler: dashboard.NewServer(state, history, ctl, cluster)}
+	srv := &http.Server{Addr: addr, Handler: dashboard.NewServer(ctx, state, history, ctl, cluster, dashboard.WithLogger(log))}
 	go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
 	log.Info("starting", "addr", addr, "namespace", namespace)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

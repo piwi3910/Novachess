@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -30,6 +31,20 @@ type fakeCluster struct {
 	// SetCoordinatorGeneration must happen before the coordinator is scaled
 	// up, or it restarts into the wrong generation).
 	calls []string
+
+	// streamLogsErrs is consumed in order, one entry per StreamJobLogs call;
+	// once exhausted, calls succeed. A nil entry means "succeed on this
+	// call". Used by the follower tests to simulate the pod-not-scheduled-
+	// yet error StreamJobLogs returns immediately after job creation.
+	streamLogsErrs  []error
+	streamLogsData  []byte
+	streamLogsCalls int
+
+	// jobResponses is consumed in order, one entry per Job call; the last
+	// entry repeats once exhausted. Used to simulate a job going from
+	// Active to terminal across several polls.
+	jobResponses []JobState
+	jobCalls     int
 }
 
 func newFakeCluster() *fakeCluster {
@@ -65,12 +80,25 @@ func (f *fakeCluster) CreateJobFromCron(_ context.Context, cronName, jobName str
 	return nil
 }
 
-func (f *fakeCluster) Job(_ context.Context, _ string) (JobState, error) {
-	return JobState{}, nil
+func (f *fakeCluster) Job(_ context.Context, name string) (JobState, error) {
+	idx := f.jobCalls
+	f.jobCalls++
+	if len(f.jobResponses) == 0 {
+		return JobState{Name: name}, nil
+	}
+	if idx >= len(f.jobResponses) {
+		idx = len(f.jobResponses) - 1
+	}
+	return f.jobResponses[idx], nil
 }
 
 func (f *fakeCluster) StreamJobLogs(_ context.Context, _ string) (io.ReadCloser, error) {
-	return nil, nil
+	idx := f.streamLogsCalls
+	f.streamLogsCalls++
+	if idx < len(f.streamLogsErrs) && f.streamLogsErrs[idx] != nil {
+		return nil, f.streamLogsErrs[idx]
+	}
+	return io.NopCloser(bytes.NewReader(f.streamLogsData)), nil
 }
 
 func writeNetworkFile(t *testing.T, dataDir string, generation int) {

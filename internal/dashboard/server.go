@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -25,19 +26,74 @@ type Server struct {
 	state   *State
 	history *History
 	ctl     *Controller
-	// cluster reads current worker/coordinator scale for /api/state;
-	// injected so tests use the fake cluster.
+	// cluster reads current worker/coordinator scale for /api/state and is
+	// used directly by the job followers; injected so tests use the fake
+	// cluster.
 	cluster Cluster
 	// trainLog fans a running trainer job's log lines out to every SSE
 	// subscriber as trainlog events. One broadcaster lives for the life of
 	// the server; only one trainer job is expected to run at a time, but
 	// nothing here assumes that - it is simply a pub/sub of lines.
 	trainLog *trainLogBroadcast
+	mux      *http.ServeMux
+	log      *slog.Logger
+
+	// ctx is the server's own lifetime context (cancelled on shutdown, e.g.
+	// by cmd/dashboard on SIGTERM). Job followers are started from it
+	// rather than from the triggering request's context, which ends the
+	// moment the HTTP response is written - long before a trainer or
+	// gatekeeper job finishes.
+	ctx context.Context
+
+	// Follower timing, overridable in tests so they don't depend on real
+	// sleeps of production length.
+	trainerRetryInterval time.Duration // how often to retry StreamJobLogs
+	trainerRetryCap      time.Duration // give up opening the log after this long
+	gatePollInterval     time.Duration // how often to poll Job() for terminal state
+	gateTimeout          time.Duration // give up waiting for the gate job after this long
 }
 
-// NewServer builds the dashboard's HTTP handler.
-func NewServer(s *State, h *History, ctl *Controller, cluster Cluster) http.Handler {
-	srv := &Server{state: s, history: h, ctl: ctl, cluster: cluster, trainLog: newTrainLogBroadcast()}
+// ServerOption configures optional Server behaviour at construction time.
+type ServerOption func(*Server)
+
+// WithLogger sets the logger the server and its job followers use. Defaults
+// to slog.Default() when not supplied.
+func WithLogger(l *slog.Logger) ServerOption {
+	return func(s *Server) { s.log = l }
+}
+
+// WithFollowerIntervals overrides the job followers' polling and retry
+// timing. Production uses the NewServer defaults; tests inject short values
+// here so retry/poll loops run to completion quickly and deterministically.
+func WithFollowerIntervals(trainerRetryInterval, trainerRetryCap, gatePollInterval, gateTimeout time.Duration) ServerOption {
+	return func(s *Server) {
+		s.trainerRetryInterval = trainerRetryInterval
+		s.trainerRetryCap = trainerRetryCap
+		s.gatePollInterval = gatePollInterval
+		s.gateTimeout = gateTimeout
+	}
+}
+
+// NewServer builds the dashboard's HTTP handler. ctx is the server's
+// lifetime context: cancelling it (on shutdown) stops any in-flight job
+// followers rather than leaking them.
+func NewServer(ctx context.Context, s *State, h *History, ctl *Controller, cluster Cluster, opts ...ServerOption) *Server {
+	srv := &Server{
+		state:                s,
+		history:              h,
+		ctl:                  ctl,
+		cluster:              cluster,
+		trainLog:             newTrainLogBroadcast(),
+		ctx:                  ctx,
+		log:                  slog.Default(),
+		trainerRetryInterval: 2 * time.Second,
+		trainerRetryCap:      2 * time.Minute,
+		gatePollInterval:     10 * time.Second,
+		gateTimeout:          6 * time.Hour,
+	}
+	for _, opt := range opts {
+		opt(srv)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", srv.getState)
 	mux.HandleFunc("GET /api/history", srv.getHistory)
@@ -48,7 +104,13 @@ func NewServer(s *State, h *History, ctl *Controller, cluster Cluster) http.Hand
 	mux.HandleFunc("POST /api/generation/advance", srv.advance)
 	dist, _ := fs.Sub(webdist.Dist, "dist")
 	mux.Handle("/", http.FileServerFS(dist))
-	return mux
+	srv.mux = mux
+	return srv
+}
+
+// ServeHTTP makes Server itself usable as an http.Handler.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
 }
 
 type selfplayInfo struct {
@@ -241,7 +303,7 @@ func (s *Server) trainerStart(w http.ResponseWriter, r *http.Request) {
 		writeControlError(w, err)
 		return
 	}
-	go s.followTrainer(context.Background(), job, body.Generation)
+	go s.followTrainer(s.ctx, job, body.Generation)
 	writeJSON(w, http.StatusOK, map[string]string{"job": job})
 }
 
@@ -257,7 +319,7 @@ func (s *Server) gatekeeperStart(w http.ResponseWriter, r *http.Request) {
 		writeControlError(w, err)
 		return
 	}
-	go s.awaitGate(context.Background(), job, body.Generation)
+	go s.awaitGate(s.ctx, job, body.Generation)
 	writeJSON(w, http.StatusOK, map[string]string{"job": job})
 }
 
@@ -278,10 +340,17 @@ func (s *Server) advance(w http.ResponseWriter, r *http.Request) {
 // followTrainer streams the trainer job's log, forwarding each line to SSE
 // subscribers as a trainlog event and, on the final-loss line, appending a
 // training history record. It runs for the lifetime of the job's logs, so
-// it is started with a background context rather than the request's.
+// it is started from the server's own lifetime context, not the triggering
+// request's (which ends as soon as the response is written).
+//
+// StreamJobLogs fails with an error whenever the job's pod has not been
+// scheduled yet - which is the ordinary state for the first several seconds
+// after the job is created - so this retries on a poll interval up to an
+// overall cap rather than treating the first failure as final.
 func (s *Server) followTrainer(ctx context.Context, jobName string, generation int) {
-	rc, err := s.ctl.cluster.StreamJobLogs(ctx, jobName)
-	if err != nil || rc == nil {
+	rc, err := s.openJobLogWithRetry(ctx, jobName)
+	if rc == nil {
+		s.log.Error("trainer log stream never opened", "job", jobName, "error", err)
 		return
 	}
 	defer rc.Close()
@@ -291,55 +360,92 @@ func (s *Server) followTrainer(ctx context.Context, jobName string, generation i
 		line := sc.Text()
 		s.trainLog.Publish(line)
 		if loss, ok := parseFinalLoss(line); ok {
-			_ = s.history.Append(Record{
+			if err := s.history.Append(Record{
 				Type:       "training",
 				Generation: generation,
 				FinalLoss:  loss,
 				JobName:    jobName,
 				At:         time.Now(),
-			})
+			}); err != nil {
+				s.log.Error("appending training history record", "job", jobName, "generation", generation, "error", err)
+			}
+		}
+	}
+}
+
+// openJobLogWithRetry retries StreamJobLogs on trainerRetryInterval until it
+// succeeds, ctx is cancelled, or trainerRetryCap elapses.
+func (s *Server) openJobLogWithRetry(ctx context.Context, jobName string) (io.ReadCloser, error) {
+	deadline := time.Now().Add(s.trainerRetryCap)
+	var lastErr error
+	for {
+		rc, err := s.cluster.StreamJobLogs(ctx, jobName)
+		if err == nil && rc != nil {
+			return rc, nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(s.trainerRetryInterval):
 		}
 	}
 }
 
 // awaitGate polls the gatekeeper job until it is no longer active, reads its
 // log once, and turns the last RESULT line into a gate history record (and
-// a promotion record, when promoted).
+// a promotion record, when promoted). It is bounded by gateTimeout - a gate
+// match can legitimately run for hours, but must not poll forever if the
+// job is somehow stuck or deleted out from under it - and by ctx, which is
+// cancelled on server shutdown.
 func (s *Server) awaitGate(ctx context.Context, jobName string, generation int) {
-	ticker := time.NewTicker(2 * time.Second)
+	ctx, cancel := context.WithTimeout(ctx, s.gateTimeout)
+	defer cancel()
+	ticker := time.NewTicker(s.gatePollInterval)
 	defer ticker.Stop()
 	for {
-		js, err := s.ctl.cluster.Job(ctx, jobName)
+		js, err := s.cluster.Job(ctx, jobName)
 		if err == nil && !js.Active && (js.Succeeded || js.Failed) {
 			break
 		}
 		select {
 		case <-ctx.Done():
+			s.log.Error("gave up waiting for gatekeeper job", "job", jobName, "generation", generation, "error", ctx.Err())
 			return
 		case <-ticker.C:
 		}
 	}
-	rc, err := s.ctl.cluster.StreamJobLogs(ctx, jobName)
+	rc, err := s.cluster.StreamJobLogs(ctx, jobName)
 	if err != nil || rc == nil {
+		s.log.Error("reading gatekeeper log", "job", jobName, "generation", generation, "error", err)
 		return
 	}
 	log, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
+		s.log.Error("reading gatekeeper log", "job", jobName, "generation", generation, "error", err)
 		return
 	}
 	rec, ok := parseResult(log)
 	if !ok {
+		s.log.Error("no RESULT line found in gatekeeper log", "job", jobName, "generation", generation)
 		return
 	}
 	rec.Generation = generation
 	rec.JobName = jobName
 	rec.At = time.Now()
-	_ = s.history.Append(rec)
+	if err := s.history.Append(rec); err != nil {
+		s.log.Error("appending gate history record", "job", jobName, "generation", generation, "error", err)
+	}
 	if rec.Promoted {
 		promo := rec
 		promo.Type = "promotion"
-		_ = s.history.Append(promo)
+		if err := s.history.Append(promo); err != nil {
+			s.log.Error("appending promotion history record", "job", jobName, "generation", generation, "error", err)
+		}
 	}
 }
 

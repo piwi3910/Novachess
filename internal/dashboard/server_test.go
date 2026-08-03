@@ -1,8 +1,11 @@
 package dashboard
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -20,7 +23,7 @@ func TestStateEndpoint(t *testing.T) {
 	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
 	fc := newFakeCluster()
 	ct := NewController(fc, h, dataDir, 4)
-	srv := NewServer(s, h, ct, fc)
+	srv := NewServer(context.Background(), s, h, ct, fc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	w := httptest.NewRecorder()
@@ -50,7 +53,7 @@ func TestStateEndpointBoardsEmptyNotNull(t *testing.T) {
 	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
 	fc := newFakeCluster()
 	ct := NewController(fc, h, dataDir, 4)
-	srv := NewServer(s, h, ct, fc)
+	srv := NewServer(context.Background(), s, h, ct, fc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	w := httptest.NewRecorder()
@@ -70,7 +73,7 @@ func TestControlEndpointsCallController(t *testing.T) {
 	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
 	fc := newFakeCluster()
 	ct := NewController(fc, h, dataDir, 4)
-	srv := NewServer(s, h, ct, fc)
+	srv := NewServer(context.Background(), s, h, ct, fc)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/selfplay/pause", nil)
 	w := httptest.NewRecorder()
@@ -99,7 +102,7 @@ func TestSSESendsStateOnChange(t *testing.T) {
 	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
 	fc := newFakeCluster()
 	ct := NewController(fc, h, dataDir, 4)
-	srv := NewServer(s, h, ct, fc)
+	srv := NewServer(context.Background(), s, h, ct, fc)
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
@@ -154,7 +157,7 @@ func TestSPAServedAtRoot(t *testing.T) {
 	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
 	fc := newFakeCluster()
 	ct := NewController(fc, h, dataDir, 4)
-	srv := NewServer(s, h, ct, fc)
+	srv := NewServer(context.Background(), s, h, ct, fc)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
@@ -175,6 +178,130 @@ func TestParseFinalLoss(t *testing.T) {
 	}
 	if _, ok := parseFinalLoss("epoch  3  loss 0.02"); ok {
 		t.Fatal("epoch lines are not the final loss")
+	}
+}
+
+func TestFollowTrainerRetriesUntilLogsOpen(t *testing.T) {
+	s := NewState()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	fc := newFakeCluster()
+	fc.streamLogsErrs = []error{
+		fmt.Errorf("dashboard: no pods for job train-gen3-1 yet"),
+		fmt.Errorf("dashboard: no pods for job train-gen3-1 yet"),
+		nil, // third attempt succeeds
+	}
+	fc.streamLogsData = []byte("epoch 1 loss 0.5\nfinal training loss 0.014205, validation loss 0.015112\n")
+	ct := NewController(fc, h, dataDir, 4)
+	srv := NewServer(context.Background(), s, h, ct, fc,
+		WithFollowerIntervals(5*time.Millisecond, time.Second, 5*time.Millisecond, time.Second))
+
+	logCh := srv.trainLog.Subscribe()
+	defer srv.trainLog.Unsubscribe(logCh)
+
+	srv.followTrainer(context.Background(), "train-gen3-1", 3)
+
+	if fc.streamLogsCalls != 3 {
+		t.Fatalf("expected 3 StreamJobLogs calls (2 failures + 1 success), got %d", fc.streamLogsCalls)
+	}
+	recs := h.Records()
+	if len(recs) != 1 || recs[0].Type != "training" || recs[0].FinalLoss != 0.014205 || recs[0].Generation != 3 {
+		t.Fatalf("expected one training record with FinalLoss 0.014205 gen 3, got %+v", recs)
+	}
+
+	select {
+	case line := <-logCh:
+		if line == "" {
+			t.Fatal("expected a non-empty trainlog line")
+		}
+	default:
+		t.Fatal("expected at least one trainlog line to have been published")
+	}
+}
+
+func TestFollowTrainerGivesUpAfterCap(t *testing.T) {
+	s := NewState()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	fc := newFakeCluster()
+	alwaysFails := make([]error, 0, 100)
+	for i := 0; i < 100; i++ {
+		alwaysFails = append(alwaysFails, fmt.Errorf("dashboard: no pods for job train-gen3-1 yet"))
+	}
+	fc.streamLogsErrs = alwaysFails
+	ct := NewController(fc, h, dataDir, 4)
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	srv := NewServer(context.Background(), s, h, ct, fc,
+		WithLogger(logger),
+		WithFollowerIntervals(2*time.Millisecond, 8*time.Millisecond, 5*time.Millisecond, time.Second))
+
+	srv.followTrainer(context.Background(), "train-gen3-1", 3)
+
+	if len(h.Records()) != 0 {
+		t.Fatalf("expected no history record when the log never opens, got %+v", h.Records())
+	}
+	if !strings.Contains(logBuf.String(), "trainer log stream never opened") {
+		t.Fatalf("expected give-up log message, got %q", logBuf.String())
+	}
+	if fc.streamLogsCalls < 2 {
+		t.Fatalf("expected multiple retries before giving up, got %d calls", fc.streamLogsCalls)
+	}
+}
+
+func TestAwaitGateAppendsGateAndPromotionRecords(t *testing.T) {
+	s := NewState()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	fc := newFakeCluster()
+	fc.jobResponses = []JobState{
+		{Active: true},
+		{Active: true},
+		{Active: false, Succeeded: true},
+	}
+	fc.streamLogsData = []byte("testing a against b\n" +
+		"RESULT {\"verdict\":\"promoted\",\"wins\":40,\"losses\":20,\"draws\":40,\"elo_delta\":35.1,\"los\":0.99,\"reason\":\"H1 accepted\"}\n")
+	ct := NewController(fc, h, dataDir, 4)
+	srv := NewServer(context.Background(), s, h, ct, fc,
+		WithFollowerIntervals(time.Second, time.Second, 5*time.Millisecond, time.Second))
+
+	srv.awaitGate(context.Background(), "gate-gen2-1", 2)
+
+	if fc.jobCalls != 3 {
+		t.Fatalf("expected 3 Job polls before terminal, got %d", fc.jobCalls)
+	}
+	recs := h.Records()
+	if len(recs) != 2 {
+		t.Fatalf("expected gate + promotion records, got %+v", recs)
+	}
+	if recs[0].Type != "gate" || !recs[0].Promoted || recs[0].Wins != 40 || recs[0].Generation != 2 {
+		t.Fatalf("unexpected gate record: %+v", recs[0])
+	}
+	if recs[1].Type != "promotion" || recs[1].Generation != 2 {
+		t.Fatalf("unexpected promotion record: %+v", recs[1])
+	}
+}
+
+func TestAwaitGateNoPromotionWhenNotPromoted(t *testing.T) {
+	s := NewState()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	fc := newFakeCluster()
+	fc.jobResponses = []JobState{{Active: false, Succeeded: true}}
+	fc.streamLogsData = []byte("RESULT {\"verdict\":\"rejected\",\"wins\":10,\"losses\":40,\"draws\":10,\"elo_delta\":-20.0,\"los\":0.01,\"reason\":\"H0 accepted\"}\n")
+	ct := NewController(fc, h, dataDir, 4)
+	srv := NewServer(context.Background(), s, h, ct, fc,
+		WithFollowerIntervals(time.Second, time.Second, 5*time.Millisecond, time.Second))
+
+	srv.awaitGate(context.Background(), "gate-gen2-1", 2)
+
+	recs := h.Records()
+	if len(recs) != 1 {
+		t.Fatalf("expected only a gate record when not promoted, got %+v", recs)
+	}
+	if recs[0].Type != "gate" || recs[0].Promoted {
+		t.Fatalf("unexpected record: %+v", recs[0])
 	}
 }
 
