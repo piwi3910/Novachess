@@ -5,11 +5,11 @@ self-play training pipeline designed to run distributed across a cluster.
 
 ## Status
 
-Under construction. The learning loop closes: self-play generates labelled
-positions, the trainer fits a network to them, and the engine plays with that
-network through the same interface as the hand-crafted evaluation. What remains
-is the services that run the loop unattended, and the gatekeeper that decides
-whether each new network is actually an improvement.
+Under construction. The learning loop closes and is self-correcting: self-play
+generates labelled positions, the trainer fits a network to them, the gatekeeper
+makes each candidate win a match before it replaces the incumbent, and the
+engine plays with whatever was promoted. What remains is the services that run
+the loop unattended across a cluster.
 
 | Component | State |
 |---|---|
@@ -25,7 +25,8 @@ whether each new network is actually an improvement.
 | Training data format and self-play generation | done |
 | Evaluation, NNUE | network, inference and accumulator done |
 | Trainer | done |
-| Pipeline services (coordinator, worker, gatekeeper) | not started |
+| Gatekeeper (SPRT match gating) | done |
+| Pipeline services (coordinator, worker) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
 GUI or match runner can load.
@@ -102,13 +103,14 @@ cmd/novabot/            Lichess bot binary
 cmd/coordinator/        work distribution and dataset assembly
 cmd/selfplay-worker/    game generation
 cmd/trainer/            network training (implemented)
-cmd/gatekeeper/         SPRT gating
+cmd/gatekeeper/         SPRT gating (implemented)
 
 internal/chess/         board, move generation, Zobrist, perft
 internal/search/        negamax, transposition table, time management
 internal/eval/          evaluation
 internal/uci/           UCI protocol
 internal/lichess/       Lichess Bot API client
+internal/gate/          SPRT, match running, promotion decisions
 internal/nnue/          trained evaluation: network, accumulator, inference
 internal/train/         self-play generation, packed data format, optimizer
 
@@ -341,6 +343,52 @@ The reported losses are diagnostics, not a verdict. A network can improve its
 loss against the training objective and still play worse — which is exactly what
 the gatekeeper's SPRT match exists to catch, and why nothing here decides
 whether a network is promoted.
+
+## Gating
+
+A trained network does not get used because its loss went down. It has to win a
+match:
+
+```
+go build ./cmd/gatekeeper
+./gatekeeper -candidate gen2.nnue -incumbent gen1.nnue
+```
+
+The exit status is the decision — 0 promoted, 1 rejected, 2 inconclusive, 3
+error — so a pipeline can branch on it without parsing text.
+
+This is what makes the loop self-correcting rather than merely self-feeding.
+Training loss measures how well a network fit the data it was shown, which is a
+different question from whether it plays better; a network can improve its loss
+and lose games. Promoted on loss alone it would then generate the next
+generation's data, and the whole loop would drift somewhere worse with nothing
+to notice.
+
+**An inconclusive match is not a promotion.** Running out of games means the
+evidence never arrived, and treating that as success would promote every
+candidate that failed to prove itself either way — which across generations is a
+random walk, not a training loop.
+
+The match is judged by a sequential probability ratio test rather than a fixed
+number of games. The two hypotheses are Elo differences rather than "better" and
+"worse": testing against zero would eventually promote a network a fraction of
+an Elo stronger, at the cost of running forever to prove it. A clearly better or
+clearly worse candidate is identified in a handful of games and only genuinely
+marginal ones run long.
+
+**Games are played in colour-reversed pairs from a shared opening.** Openings are
+not perfectly balanced, so playing each one once would measure the openings as
+much as the networks. This also gives an exact test of the harness rather than a
+statistical one: two deterministic engines with the same evaluation play the
+identical game whichever colour they are given, so a network matched against
+itself must score *exactly* 50% — not approximately, and however few games are
+played. Any bias breaks it immediately, and a statistical check would need
+thousands of games to see what this sees in twelve.
+
+Matches search by nodes and run one thread, for the same reasons self-play does:
+a match decided partly by which process got more CPU measures nothing, and a
+gating decision that cannot be reproduced cannot be audited when a promotion
+later looks like a mistake.
 
 ## Running
 
