@@ -143,16 +143,41 @@ func EncodeSample(s Sample) (packed, error) {
 
 	binary.LittleEndian.PutUint16(p[26:28], uint16(s.Score))
 	binary.LittleEndian.PutUint16(p[28:30], s.Ply)
+
+	// The result is the one field nothing downstream can sanity-check: any byte
+	// decodes to some Result, and a wrong one teaches the network the opposite
+	// of what the game showed. A value outside the three outcomes means the
+	// caller has a bug, and writing it would bury that bug in a dataset.
+	switch s.Result {
+	case WhiteWon, Drawn, BlackWon:
+	default:
+		return packed{}, fmt.Errorf("train: result %d is not a game outcome", s.Result)
+	}
 	p[30] = byte(s.Result)
 
 	return p, nil
 }
 
 // DecodeSample unpacks a record.
+//
+// Every field is checked before it is used. Decoding is the side of this format
+// that reads bytes it did not write — a truncated upload, a half-flushed file
+// from a worker that was evicted, a length that disagrees with the header — so
+// a malformed record has to come back as an error rather than as a panic in the
+// middle of a training run.
 func DecodeSample(p packed) (Sample, error) {
 	var s Sample
 
 	occ := chess.Bitboard(binary.LittleEndian.Uint64(p[0:8]))
+	// The nibble array holds 32 pieces. A larger occupancy would read past the
+	// end of the record, so it is rejected before anything indexes into it.
+	if n := occ.Count(); n > 32 {
+		return s, fmt.Errorf("train: occupancy claims %d pieces, the format holds at most 32", n)
+	}
+	if p[31] != 0 {
+		return s, fmt.Errorf("train: reserved byte is %d, want 0", p[31])
+	}
+
 	meta := binary.LittleEndian.Uint16(p[24:26])
 
 	side := chess.White
@@ -160,7 +185,13 @@ func DecodeSample(p packed) (Sample, error) {
 		side = chess.Black
 	}
 	castling := chess.CastlingRights((meta >> 1) & 0xF)
+	// The en passant field is a file, or 8 for none. Anything else would fall
+	// through to "no en passant" and silently decode as a different position
+	// from the one that was written.
 	epFile := int((meta >> 5) & 0xF)
+	if epFile > 8 {
+		return s, fmt.Errorf("train: en passant field is %d, want a file or 8 for none", epFile)
+	}
 
 	// Rebuild the position through FEN rather than by poking at internals, so
 	// a decoded sample goes through exactly the same validation as any other

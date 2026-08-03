@@ -36,10 +36,18 @@ func (s GameStats) NodesPerSecond() float64 {
 
 // Generator plays self-play games for a work unit.
 //
-// One generator serves one worker and is used serially. Everything about it is
-// deterministic: given the same WorkUnit it produces byte-identical samples,
-// on any machine, which is what makes a redelivered unit safe to replay and
-// makes the whole distributed pipeline reproducible.
+// One generator serves one worker and is used serially. Given the same work
+// unit it produces byte-identical samples on any machine, which is what makes a
+// redelivered unit safe to replay and the pipeline reproducible.
+//
+// That guarantee is over the unit and the generator together, not the unit
+// alone. The evaluator and the hash size are as much a part of the input as the
+// seed: a different network plays different moves, and a different table size
+// changes which entries collide and therefore which scores the search finds.
+// Neither is carried in the unit, so it falls to the coordinator to pair a unit
+// with the generation of network its ID names, and to give every worker the
+// same hash size. A worker configured with a different one produces data that
+// is internally consistent and quietly not reproducible by anyone else.
 type Generator struct {
 	evaluator eval.Evaluator
 	hashMB    int

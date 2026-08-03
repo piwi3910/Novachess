@@ -3,6 +3,7 @@ package train
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -249,6 +250,146 @@ func TestReaderRejectsTruncatedRecord(t *testing.T) {
 	}
 	if _, err := r.Read(); err == nil {
 		t.Error("reader accepted a truncated record, want an error")
+	}
+}
+
+// TestDecodeRejectsCorruptRecords covers the bytes a decoder is handed but did
+// not write: a half-flushed file from an evicted worker, a truncated upload, a
+// record from a build that disagrees about the layout. Every one of these must
+// come back as an error, since a panic would take down a training run mid-pass
+// and a silent misread would poison the dataset.
+func TestDecodeRejectsCorruptRecords(t *testing.T) {
+	// A valid record to corrupt one field at a time.
+	valid, err := EncodeSample(Sample{Position: chess.NewPosition(), Score: 30, Result: Drawn, Ply: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		corrupt func(p *packed)
+	}{
+		{
+			// The nibble array holds 32 pieces; a wider occupancy would read
+			// past the end of the record.
+			"occupancy wider than the nibble array",
+			func(p *packed) {
+				for i := 0; i < 8; i++ {
+					p[i] = 0xFF
+				}
+			},
+		},
+		{
+			"en passant field is not a file",
+			func(p *packed) {
+				meta := binary.LittleEndian.Uint16(p[24:26])
+				meta = (meta &^ (0xF << 5)) | (12 << 5)
+				binary.LittleEndian.PutUint16(p[24:26], meta)
+			},
+		},
+		{
+			"reserved byte is not zero",
+			func(p *packed) { p[31] = 1 },
+		},
+		{
+			// The occupancy says a piece is there, so the nibble must name one.
+			"piece code outside the piece range",
+			func(p *packed) { p[8] = 0xFF },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := valid
+			tc.corrupt(&p)
+
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("decoding panicked instead of returning an error: %v", r)
+				}
+			}()
+			if _, err := DecodeSample(p); err == nil {
+				t.Error("decoded a corrupt record without complaint, want an error")
+			}
+		})
+	}
+}
+
+// TestDecodeSurvivesArbitraryBytes is the blunt version of the above: no
+// 32-byte input may panic, whatever it contains. Rejecting is fine, decoding to
+// something legal is fine, crashing is not.
+//
+// Half the records are pure noise and half are valid records with bytes flipped
+// in them. The noise mostly fails at the first check, so it proves little on its
+// own; the mutated records are the ones that reach deep into the decoder, since
+// they are correct everywhere the mutation did not touch.
+func TestDecodeSurvivesArbitraryBytes(t *testing.T) {
+	r := newRNG(0xC0FFEE)
+
+	valid, err := EncodeSample(Sample{
+		Position: mustParse(t, "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"),
+		Score:    120, Result: WhiteWon, Ply: 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const rounds = 20000
+	noiseDecoded, mutantDecoded := 0, 0
+
+	for i := 0; i < rounds; i++ {
+		p := packed{}
+		mutated := i%2 == 1
+		if mutated {
+			// A valid record with one to three bytes overwritten.
+			p = valid
+			for n := int(r.next()%3) + 1; n > 0; n-- {
+				p[r.next()%RecordSize] = byte(r.next())
+			}
+		} else {
+			for j := 0; j < RecordSize; j += 8 {
+				binary.LittleEndian.PutUint64(p[j:j+8], r.next())
+			}
+		}
+
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					t.Fatalf("record %d panicked: %v\nbytes: %x", i, rec, p)
+				}
+			}()
+			if _, err := DecodeSample(p); err == nil {
+				if mutated {
+					mutantDecoded++
+				} else {
+					noiseDecoded++
+				}
+			}
+		}()
+	}
+
+	// The mutated half must actually be reaching the decoder rather than being
+	// turned away at the first check, or this test proves nothing.
+	if mutantDecoded == 0 {
+		t.Error("no mutated record decoded successfully; the fuzz is not reaching past the early guards")
+	}
+	t.Logf("%d records survived without a panic: %d of %d noise and %d of %d mutants decoded as legal positions",
+		rounds, noiseDecoded, rounds/2, mutantDecoded, rounds/2)
+}
+
+// TestEncodeRejectsUnknownResult guards the one label nothing downstream can
+// sanity-check. Any byte decodes to some Result, so a bad one is invisible
+// after the fact — and it teaches the network the opposite of what happened.
+func TestEncodeRejectsUnknownResult(t *testing.T) {
+	for _, bad := range []Result{2, -2, 127, -128} {
+		if _, err := EncodeSample(Sample{Position: chess.NewPosition(), Result: bad}); err == nil {
+			t.Errorf("encoded result %d, which is not a game outcome", bad)
+		}
+	}
+	for _, good := range []Result{WhiteWon, Drawn, BlackWon} {
+		if _, err := EncodeSample(Sample{Position: chess.NewPosition(), Result: good}); err != nil {
+			t.Errorf("rejected result %d, which is a game outcome: %v", good, err)
+		}
 	}
 }
 
