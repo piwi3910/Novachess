@@ -19,7 +19,22 @@ package chess
 
 // GenerateLegalMoves fills ml with every legal move in the position. Any
 // existing contents are discarded.
-func (p *Position) GenerateLegalMoves(ml *MoveList) {
+func (p *Position) GenerateLegalMoves(ml *MoveList) { p.generate(ml, false) }
+
+// GenerateCaptures fills ml with the moves quiescence search considers: every
+// capture, including en passant, plus every promotion.
+//
+// Promotions are included even when they are quiet pushes, because a pawn
+// becoming a queen is a larger material swing than most captures and a search
+// that stopped without seeing it would badly misjudge the position.
+//
+// When the side to move is in check this generates *all* legal moves instead.
+// Quiescence must be able to see quiet escapes: a king whose only move is to
+// step onto an empty square would otherwise appear to have no moves at all and
+// be scored as checkmate.
+func (p *Position) GenerateCaptures(ml *MoveList) { p.generate(ml, true) }
+
+func (p *Position) generate(ml *MoveList, capturesOnly bool) {
 	ml.Count = 0
 
 	us := p.side
@@ -27,11 +42,21 @@ func (p *Position) GenerateLegalMoves(ml *MoveList) {
 	ksq := p.KingSquare(us)
 	occ := p.Occupied()
 	ourPieces := p.byColor[us]
-	checkers := p.AttackersTo(ksq, occ) & p.byColor[them]
+	theirPieces := p.byColor[them]
+	checkers := p.AttackersTo(ksq, occ) & theirPieces
+
+	// Evasions are never restricted to captures; see GenerateCaptures.
+	if checkers != 0 {
+		capturesOnly = false
+	}
 
 	// King moves are legal regardless of check state, so they are always
 	// generated.
-	p.genKingMoves(ml, ksq, them, occ, ourPieces)
+	kingTargets := ^ourPieces
+	if capturesOnly {
+		kingTargets = theirPieces
+	}
+	p.genKingMoves(ml, ksq, them, occ, kingTargets)
 
 	// Under double check no interposition or capture can resolve both threats
 	// at once, so only the king may move.
@@ -40,20 +65,31 @@ func (p *Position) GenerateLegalMoves(ml *MoveList) {
 	}
 
 	var targets Bitboard
-	if checkers != 0 {
+	switch {
+	case checkers != 0:
 		// Single check: capture the checker or block the line to it. A knight
 		// or pawn checker has an empty BetweenBB, leaving capture as the only
 		// non-king option, which is correct.
 		checkerSq := checkers.First()
 		targets = BetweenBB[ksq][checkerSq] | checkerSq.BB()
-	} else {
+	case capturesOnly:
+		targets = theirPieces
+	default:
 		targets = ^ourPieces
 		p.genCastling(ml, us, occ)
 	}
 
+	// Pawn pushes land on empty squares, so in captures-only mode they fall
+	// outside targets automatically. Promotions are the exception and are
+	// admitted by their own mask.
+	quietTargets := targets
+	if capturesOnly {
+		quietTargets = RankBB[0] | RankBB[7]
+	}
+
 	pinned := p.blockersForKing(us) & ourPieces
 
-	p.genPawnMoves(ml, us, targets, pinned, ksq, occ)
+	p.genPawnMoves(ml, us, targets, quietTargets, pinned, ksq, occ)
 	p.genPieceMoves(ml, us, targets, pinned, ksq, occ)
 }
 
@@ -104,14 +140,15 @@ func (p *Position) blockersForKing(c Color) Bitboard {
 	return blockers
 }
 
-// genKingMoves generates king moves, excluding any square attacked by the enemy.
-func (p *Position) genKingMoves(ml *MoveList, ksq Square, them Color, occ, ourPieces Bitboard) {
+// genKingMoves generates king moves to the given targets, excluding any square
+// attacked by the enemy.
+func (p *Position) genKingMoves(ml *MoveList, ksq Square, them Color, occ, targets Bitboard) {
 	// The king must be removed from the occupancy before testing destinations:
 	// otherwise it blocks the very slider that is checking it, and stepping
 	// straight backwards along the check ray would look safe.
 	occWithoutKing := occ &^ ksq.BB()
 
-	for attacks := KingAttacks[ksq] &^ ourPieces; attacks != 0; {
+	for attacks := KingAttacks[ksq] & targets; attacks != 0; {
 		var to Square
 		to, attacks = attacks.PopFirst()
 		if p.AttackersTo(to, occWithoutKing)&p.byColor[them] == 0 {
@@ -219,7 +256,10 @@ func (p *Position) genPieceMoves(ml *MoveList, us Color, targets, pinned Bitboar
 }
 
 // genPawnMoves generates pawn pushes, captures, promotions and en passant.
-func (p *Position) genPawnMoves(ml *MoveList, us Color, targets, pinned Bitboard, ksq Square, occ Bitboard) {
+//
+// targets restricts captures; quietTargets restricts pushes. The two differ
+// only in quiescence, where pushes are limited to the promotion ranks.
+func (p *Position) genPawnMoves(ml *MoveList, us Color, targets, quietTargets, pinned Bitboard, ksq Square, occ Bitboard) {
 	push := PawnPush(us)
 	theirPieces := p.byColor[us.Opposite()]
 
@@ -240,12 +280,12 @@ func (p *Position) genPawnMoves(ml *MoveList, us Color, targets, pinned Bitboard
 		// Pushes. Pawns can never stand on the back ranks, so stepping one
 		// square forward is always on the board.
 		if to := Square(int(from) + push); !occ.Has(to) {
-			if targets.Has(to) && pinMask.Has(to) {
+			if quietTargets.Has(to) && pinMask.Has(to) {
 				addPawnMove(ml, from, to, promoRank)
 			}
 			if from.Rank() == startRank {
 				if to2 := Square(int(to) + push); !occ.Has(to2) &&
-					targets.Has(to2) && pinMask.Has(to2) {
+					quietTargets.Has(to2) && pinMask.Has(to2) {
 					ml.Add(NewMove(from, to2))
 				}
 			}
