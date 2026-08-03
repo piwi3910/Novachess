@@ -1,3 +1,3 @@
 module github.com/piwi3910/novachess
 
-go 1.24.7
+go 1.26.0
