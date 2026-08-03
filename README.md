@@ -5,8 +5,10 @@ self-play training pipeline designed to run distributed across a cluster.
 
 ## Status
 
-Under construction. The move generator is complete and perft-verified; search,
-evaluation, UCI and the Lichess client are not yet implemented.
+Under construction. The engine plays: it is a working UCI engine with a Lichess
+bot, and the self-play half of the training loop generates data. What remains is
+the network that data is meant to train, and the services that run the loop
+unattended.
 
 | Component | State |
 |---|---|
@@ -19,6 +21,7 @@ evaluation, UCI and the Lichess client are not yet implemented.
 | Evaluation, hand-crafted | done |
 | UCI protocol and engine binary | done |
 | Lichess bot client | done |
+| Training data format and self-play generation | done |
 | Evaluation, NNUE | not started |
 | Pipeline services (coordinator, worker, trainer, gatekeeper) | not started |
 
@@ -99,7 +102,7 @@ internal/search/        negamax, transposition table, time management
 internal/eval/          evaluation
 internal/uci/           UCI protocol
 internal/lichess/       Lichess Bot API client
-internal/train/         self-play, data format, optimizer
+internal/train/         self-play generation, packed data format, optimizer
 
 internal/events/        message contracts shared by all services
 internal/bus/           message bus abstraction and NATS implementation
@@ -219,6 +222,39 @@ depth 5 across every arrangement — 635 million leaf nodes, all exact — with 
 sampled depth-6 pass under `-perft-full`. The orthodox arrangement written in
 Shredder notation is separately required to reproduce the classical perft counts
 exactly, which pins the generalized code to ground truth everyone agrees on.
+
+## Training data
+
+Self-play produces labelled positions in a packed 32-byte record: an occupancy
+bitboard, one nibble per occupied square, and the side to move, castling rights
+and en passant file in two more bytes, leaving the search score, the eventual
+game result and the ply. Storing FENs instead would roughly triple a dataset
+meant to reach a billion positions. Files carry a magic number and a version,
+and a reader refuses anything it does not recognize rather than reading old
+bytes under new rules — the resulting positions would look plausible and their
+labels would be meaningless, which is the one corruption nothing downstream can
+detect.
+
+**Score and result are both White-relative**, deliberately unlike the engine's
+own side-to-move convention. A file mixing the two orientations cannot be
+interpreted without knowing which record uses which, and reading it wrong trains
+the network to prefer losing positions.
+
+Positions where the side to move is in check, where the best move is a capture,
+or whose score is a mate score are dropped. Their evaluation describes a tactic
+about to resolve rather than the position itself, and training on them teaches
+the network to imitate the search instead of judging the quiet positions it will
+actually be asked about at the leaves. Games that hit the ply cap without
+finishing are discarded whole, since their positions have no trustworthy label.
+
+Generation is deterministic: a work unit fixes a seed and a node budget, and
+replaying it produces byte-identical samples on any machine. This is what makes
+a unit safe to redeliver when a cluster node is evicted mid-job. Two things
+follow from it. Self-play searches by nodes and never by time, since a slower
+node given a time limit would search less and play different moves; and it runs
+one thread, because lazy SMP works by letting threads race and is
+non-deterministic by construction. Scale with more workers, not more threads per
+worker.
 
 ## Running
 
