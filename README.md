@@ -33,15 +33,29 @@ reasoning behind where the boundary between engine and services falls.
 **Search.** Classical alpha-beta rather than MCTS: negamax with iterative
 deepening, aspiration windows, a Zobrist transposition table, quiescence search,
 null-move pruning, reverse futility, late move reductions, and killer/history
-move ordering. Lazy SMP for multithreading is not yet implemented.
+move ordering. Lazy SMP for multithreading, via the `Threads` option.
+
+Threads share nothing but the transposition table, which uses lockless hashing:
+each entry is one packed word stored alongside that word XOR-ed with the
+position key, so a reader that catches a writer mid-update sees a mismatch and
+treats the entry as a miss. Locking a structure probed millions of times a
+second would defeat the point of threading, and leaving it unsynchronized is a
+data race — undefined behaviour in Go, not merely untidy.
 
 Two properties are treated as requirements rather than nice-to-haves. The
 principal variation must be legal move by move, which is what catches
 corruption in the PV table, the transposition table or make/unmake — all of
 which otherwise surface only as mysteriously bad play. And a fixed-depth or
-fixed-node search must be deterministic, because the distributed pipeline
-replays work units on different nodes and the training data cannot be allowed
-to depend on which machine ran them.
+fixed-node search must be deterministic **at one thread**, because the
+distributed pipeline replays work units on different nodes and the training
+data cannot be allowed to depend on which machine ran them.
+
+That second property is why `Threads` defaults to 1 and why the thread count is
+a policy decision rather than a performance knob. Lazy SMP works precisely by
+letting threads race on the shared table, so more than one thread is
+non-deterministic by construction. Self-play must run one thread per worker —
+scale by running more workers, not more threads per worker. Match play and
+analysis, where reproducibility does not matter, should use every core.
 
 **Evaluation.** A hand-crafted evaluation first, so the engine plays early and
 can generate the initial self-play data. It is tapered between middlegame and

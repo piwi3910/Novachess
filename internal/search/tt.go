@@ -29,40 +29,81 @@ const (
 	BoundExact
 )
 
-// entry is one transposition table slot, packed into 16 bytes so that four fit
-// in a cache line.
+// An entry is packed into one 64-bit word, stored alongside that word XOR-ed
+// with the position key.
 //
-// The key is truncated to 32 bits. The remaining bits of the position's Zobrist
-// key select the bucket, so a collision needs both the bucket and the stored
-// half to match. Collisions are still possible, which is why a table move is
-// only ever used for ordering: it is matched by equality against the generated
-// legal moves, so a move belonging to some other position simply never matches
-// and is silently ignored rather than played.
+// This is lockless hashing, and it solves two problems at once. Threads share
+// the table without synchronization — which is the whole basis of lazy SMP —
+// and a reader that catches a writer mid-update sees a mismatched pair, so the
+// XOR fails to reproduce the key and the entry is simply treated as a miss.
+// Without the trick, a torn read could return one position's score under
+// another position's key.
+//
+// The alternative, locking the table, would serialize something probed millions
+// of times a second and defeat the point of threading entirely. Plain
+// unsynchronized fields are not an option either: in Go that is a data race,
+// which is undefined behaviour rather than merely untidy.
 type entry struct {
-	key32 uint32     // upper half of the Zobrist key
-	move  chess.Move // best move found, for ordering
-	score int16
-	eval  int16
-	depth int8
-	gen   uint8 // generation stamp, for replacement
-	bound Bound
-	_     uint8 // padding to a round 16 bytes
+	keyx atomic.Uint64 // key ^ data
+	data atomic.Uint64
 }
 
-// bucketSize is how many entries share a bucket. Four gives a useful choice of
-// replacement victims while keeping a bucket inside one 64-byte cache line, so
-// a probe touches exactly one line.
+// Field layout within the packed word.
+const (
+	shiftMove  = 0
+	shiftScore = 16
+	shiftEval  = 32
+	shiftDepth = 48
+	shiftBound = 56
+	shiftGen   = 58
+
+	maskBound = 0x3
+	maskGen   = 0x3F
+)
+
+func packEntry(move chess.Move, score, staticEval int, depth int, bound Bound, gen uint8) uint64 {
+	return uint64(uint16(move)) |
+		uint64(uint16(int16(score)))<<shiftScore |
+		uint64(uint16(int16(staticEval)))<<shiftEval |
+		uint64(uint8(depth))<<shiftDepth |
+		uint64(bound&maskBound)<<shiftBound |
+		uint64(gen&maskGen)<<shiftGen
+}
+
+func (d unpacked) move() chess.Move { return chess.Move(uint16(d)) }
+func (d unpacked) score() int       { return int(int16(uint16(d >> shiftScore))) }
+func (d unpacked) depth() int       { return int(uint8(d >> shiftDepth)) }
+func (d unpacked) bound() Bound     { return Bound(d>>shiftBound) & maskBound }
+func (d unpacked) gen() uint8       { return uint8(d>>shiftGen) & maskGen }
+
+type unpacked uint64
+
+// read returns the entry's contents and whether they belong to the given key.
+func (e *entry) read(key uint64) (unpacked, bool) {
+	// data is loaded first so that a writer racing between the two loads
+	// produces a mismatch rather than a plausible-looking pair.
+	data := e.data.Load()
+	keyx := e.keyx.Load()
+	return unpacked(data), keyx^data == key && data != 0
+}
+
+func (e *entry) write(key, data uint64) {
+	e.keyx.Store(key ^ data)
+	e.data.Store(data)
+}
+
+func (e *entry) clear() {
+	e.keyx.Store(0)
+	e.data.Store(0)
+}
+
+// bucketSize is how many entries share a bucket. Four 16-byte entries fill one
+// 64-byte cache line, so a probe touches exactly one line.
 const bucketSize = 4
 
 type bucket [bucketSize]entry
 
-// TT is a transposition table.
-//
-// It is shared unsynchronized across search threads. That is deliberate and is
-// how lazy SMP works: races can produce a torn entry, which the key check
-// almost always rejects and which the pseudo-legality check catches otherwise.
-// The cost of that rare corruption is far smaller than the cost of locking a
-// structure probed millions of times a second.
+// TT is a transposition table shared by every search thread.
 type TT struct {
 	buckets []bucket
 	mask    uint64
@@ -76,7 +117,7 @@ func NewTT(megabytes int) *TT {
 	if megabytes < 1 {
 		megabytes = 1
 	}
-	bytesPerBucket := 64 // one cache line
+	const bytesPerBucket = 64
 	want := megabytes * 1024 * 1024 / bytesPerBucket
 
 	count := 1
@@ -93,7 +134,9 @@ func NewTT(megabytes int) *TT {
 // Clear empties the table.
 func (t *TT) Clear() {
 	for i := range t.buckets {
-		t.buckets[i] = bucket{}
+		for j := range t.buckets[i] {
+			t.buckets[i][j].clear()
+		}
 	}
 	t.gen.Store(0)
 }
@@ -111,25 +154,24 @@ func (t *TT) NewSearch() { t.gen.Add(1) }
 // back to be relative to the root here; see adjustMateScoreFromTT.
 func (t *TT) Probe(key uint64, depth, ply int, alpha, beta int) (move chess.Move, score int, hit, usable bool) {
 	b := &t.buckets[key&t.mask]
-	want := uint32(key >> 32)
 
 	for i := range b {
-		e := &b[i]
-		if e.key32 != want || e.bound == BoundNone {
+		d, ok := b[i].read(key)
+		if !ok || d.bound() == BoundNone {
 			continue
 		}
 
-		move = e.move
-		score = adjustMateScoreFromTT(int(e.score), ply)
+		move = d.move()
+		score = adjustMateScoreFromTT(d.score(), ply)
 		hit = true
 
 		// A shallower entry cannot justify a cutoff, but its move is still the
 		// best ordering hint available.
-		if int(e.depth) < depth {
+		if d.depth() < depth {
 			return move, score, true, false
 		}
 
-		switch e.bound {
+		switch d.bound() {
 		case BoundExact:
 			usable = true
 		case BoundLower:
@@ -150,30 +192,35 @@ func (t *TT) Probe(key uint64, depth, ply int, alpha, beta int) (move chess.Move
 // compute than a shallow one and is worth far more when it hits again.
 func (t *TT) Store(key uint64, move chess.Move, score, staticEval, depth, ply int, bound Bound) {
 	b := &t.buckets[key&t.mask]
-	want := uint32(key >> 32)
 	gen := uint8(t.gen.Load())
 
 	victim := 0
 	bestValue := int(1 << 30)
 
 	for i := range b {
-		e := &b[i]
+		d, matches := b[i].read(key)
 
-		if e.bound == BoundNone || e.key32 == want {
+		if d.bound() == BoundNone || matches {
 			victim = i
 			// An existing entry for this position is replaced unless what is
 			// already there was searched deeper and is exact. Keeping a deep
 			// exact score over a shallow bound is strictly better.
-			if e.key32 == want && e.bound == BoundExact && int(e.depth) > depth && bound != BoundExact {
+			if matches && d.bound() == BoundExact && d.depth() > depth && bound != BoundExact {
 				return
+			}
+			// Preserve the existing move when this store has none: a fail-low
+			// node records no best move, but the move stored earlier is still
+			// the best ordering hint known for the position.
+			if matches && move.IsNone() {
+				move = d.move()
 			}
 			break
 		}
 
 		// Value a slot by its depth, discounted heavily if it is from an older
 		// search. Lower is more replaceable.
-		value := int(e.depth)
-		if e.gen != gen {
+		value := d.depth()
+		if d.gen() != gen {
 			value -= 64
 		}
 		if value < bestValue {
@@ -182,23 +229,8 @@ func (t *TT) Store(key uint64, move chess.Move, score, staticEval, depth, ply in
 		}
 	}
 
-	// Preserve the existing move when this store has none: a fail-low node
-	// records no best move, but the move stored earlier is still the best
-	// ordering hint known for the position.
-	e := &b[victim]
-	if move.IsNone() && e.key32 == want {
-		move = e.move
-	}
-
-	*e = entry{
-		key32: want,
-		move:  move,
-		score: int16(adjustMateScoreToTT(score, ply)),
-		eval:  int16(clampToInt16(staticEval)),
-		depth: int8(depth),
-		gen:   gen,
-		bound: bound,
-	}
+	b[victim].write(key, packEntry(move, adjustMateScoreToTT(score, ply), clampToInt16(staticEval),
+		clampDepth(depth), bound, gen))
 }
 
 // Mate scores must be stored relative to the node that found them rather than
@@ -242,6 +274,16 @@ func clampToInt16(v int) int {
 	return v
 }
 
+func clampDepth(d int) int {
+	if d < 0 {
+		return 0
+	}
+	if d > 255 {
+		return 255
+	}
+	return d
+}
+
 // Hashfull reports approximate table occupancy in permille, which UCI expects
 // to report to the GUI. It samples rather than scanning, since the table can be
 // gigabytes.
@@ -254,8 +296,8 @@ func (t *TT) Hashfull() int {
 	used, seen := 0, 0
 	for i := 0; i < sample && i < len(t.buckets); i++ {
 		for j := range t.buckets[i] {
-			e := &t.buckets[i][j]
-			if e.bound != BoundNone && e.gen == gen {
+			d := unpacked(t.buckets[i][j].data.Load())
+			if d.bound() != BoundNone && d.gen() == gen {
 				used++
 			}
 			seen++

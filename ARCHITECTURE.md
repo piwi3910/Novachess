@@ -151,6 +151,12 @@ This is a hard requirement, not an aspiration:
 - Zobrist keys are generated from a fixed seed.
 - Work units carry an explicit RNG seed; workers derive all randomness from it.
 - Self-play searches use fixed node counts, never wall-clock time limits.
+- **Self-play workers run one search thread each.** Lazy SMP works by letting
+  threads race on a shared transposition table, so a multithreaded search is
+  non-deterministic by construction. Scale a node by running more worker pods,
+  never by raising a worker's thread count. The gatekeeper's match play may use
+  as many threads as it likes, since nothing downstream depends on reproducing
+  those games.
 
 The last point is the one that is easy to get wrong. A time-based search returns
 different results on a thermally throttled Orange Pi than on an idle one, which

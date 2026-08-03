@@ -37,6 +37,11 @@ const (
 	defaultHashMB = 64
 	minHashMB     = 1
 	maxHashMB     = 32768
+
+	// One thread by default. Beyond performance, a single thread is the only
+	// configuration that searches deterministically, and the self-play workers
+	// depend on that; a GUI that wants more will say so.
+	defaultThreads = 1
 )
 
 // Engine wires the UCI protocol to a searcher.
@@ -141,6 +146,7 @@ func (e *Engine) identify() {
 	e.sendf("id name %s %s", EngineName, e.version)
 	e.sendf("id author %s", EngineAuthor)
 	e.sendf("option name Hash type spin default %d min %d max %d", defaultHashMB, minHashMB, maxHashMB)
+	e.sendf("option name Threads type spin default %d min 1 max %d", defaultThreads, search.MaxThreads)
 	e.sendf("option name UCI_Chess960 type check default false")
 	e.send("uciok")
 }
@@ -181,6 +187,14 @@ func (e *Engine) setOption(args []string) {
 		e.stopSearch()
 		e.hashMB = mb
 		e.searcher.SetHashSize(mb)
+
+	case "threads":
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return
+		}
+		e.stopSearch()
+		e.searcher.SetThreads(clamp(n, 1, search.MaxThreads))
 
 	case "uci_chess960":
 		e.chess960 = strings.EqualFold(value, "true")

@@ -17,6 +17,7 @@ package search
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -80,15 +81,52 @@ type Searcher struct {
 	tt        *TT
 	evaluator eval.Evaluator
 	stopped   atomic.Bool
+
+	threads int
+	// totalNodes aggregates every thread's node count so that progress reports
+	// describe the whole search rather than one thread's share.
+	totalNodes atomic.Uint64
 }
 
-// New returns a searcher with a table of the given size in megabytes.
+// New returns a searcher with a table of the given size in megabytes, searching
+// on a single thread.
 func New(evaluator eval.Evaluator, hashMB int) *Searcher {
 	return &Searcher{
 		tt:        NewTT(hashMB),
 		evaluator: evaluator,
+		threads:   1,
 	}
 }
+
+// SetThreads sets how many threads a search uses.
+//
+// One thread is not merely the default but a distinct guarantee: a single
+// thread produces identical results for identical inputs, and more than one
+// does not. Lazy SMP works precisely by letting threads race on a shared
+// transposition table, so which thread reaches a position first — and therefore
+// what the search concludes — depends on timing.
+//
+// That makes the choice a policy decision rather than a performance knob.
+// Self-play must run one thread per worker, because the pipeline replays work
+// units on different nodes and the training data cannot depend on which machine
+// ran them. Match play and analysis, where reproducibility does not matter,
+// should use as many as are available.
+func (s *Searcher) SetThreads(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > MaxThreads {
+		n = MaxThreads
+	}
+	s.threads = n
+}
+
+// Threads reports the configured thread count.
+func (s *Searcher) Threads() int { return s.threads }
+
+// MaxThreads bounds the thread count. Each thread holds its own search state of
+// a few hundred kilobytes, so the limit is about memory rather than usefulness.
+const MaxThreads = 256
 
 // SetHashSize replaces the transposition table. Existing contents are lost,
 // which is why UCI only allows it between games.
@@ -133,44 +171,97 @@ type state struct {
 	maxNodes uint64
 	ctx      context.Context
 	aborted  bool
+
+	// reported is how much of nodes has already been added to the searcher's
+	// shared total, so each flush contributes only the delta.
+	reported uint64
+	// threadID is zero for the thread whose result is reported; helpers use it
+	// to stagger their starting depth.
+	threadID int
 }
 
 // Search finds the best move. onInfo, when non-nil, is called once per
-// completed iteration.
+// completed iteration of the reporting thread.
 func (s *Searcher) Search(ctx context.Context, pos *chess.Position, limits Limits, onInfo func(Info)) Result {
 	s.stopped.Store(false)
 	s.tt.NewSearch()
+	s.totalNodes.Store(0)
 
-	st := &state{
-		s:        s,
-		pos:      pos.Clone(),
-		ctx:      ctx,
-		maxNodes: limits.Nodes,
+	// A legal move must be returned even if the search is stopped before it
+	// completes anything, so the result is seeded before searching.
+	var root chess.MoveList
+	pos.GenerateLegalMoves(&root)
+	if root.Count == 0 {
+		return Result{}
 	}
 
 	start := time.Now()
 	soft, hard := budget(limits, pos.SideToMove())
-	if hard > 0 {
-		st.deadline = start.Add(hard)
-		st.hardStop = true
-	}
 
 	maxDepth := limits.Depth
 	if maxDepth <= 0 || maxDepth > MaxPly-1 {
 		maxDepth = MaxPly - 1
 	}
 
-	// A legal move must be returned even if the search is stopped before it
-	// completes anything, so seed the result before searching.
-	var root chess.MoveList
-	st.pos.GenerateLegalMoves(&root)
-	if root.Count == 0 {
-		return Result{}
+	newState := func(id int) *state {
+		st := &state{
+			s:        s,
+			pos:      pos.Clone(),
+			ctx:      ctx,
+			maxNodes: limits.Nodes,
+			threadID: id,
+		}
+		if hard > 0 {
+			st.deadline = start.Add(hard)
+			st.hardStop = true
+		}
+		return st
 	}
-	result := Result{Best: root.Moves[0]}
+
+	// Helper threads search the same position concurrently, sharing only the
+	// transposition table. They report nothing; their contribution is the
+	// entries they leave behind, which deepen and improve the main thread's
+	// search. This is lazy SMP: no work is partitioned and no thread waits for
+	// another.
+	var wg sync.WaitGroup
+	for id := 1; id < s.threads; id++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			newState(id).iterate(limits, maxDepth, soft, start, nil)
+		}(id)
+	}
+
+	result := newState(0).iterate(limits, maxDepth, soft, start, onInfo)
+	if result.Best.IsNone() {
+		result.Best = root.Moves[0]
+	}
+
+	// The main thread has its answer, so the helpers' work can no longer
+	// change it.
+	s.stopped.Store(true)
+	wg.Wait()
+
+	return result
+}
+
+// iterate runs iterative deepening for one thread.
+func (st *state) iterate(limits Limits, maxDepth int, soft time.Duration, start time.Time, onInfo func(Info)) Result {
+	var result Result
+
+	// Helper threads begin one or two plies deeper than the main thread so
+	// that they immediately explore different parts of the tree instead of
+	// duplicating its early iterations.
+	depth := 1
+	if st.threadID > 0 {
+		depth += st.threadID % 3
+		if depth > maxDepth {
+			depth = maxDepth
+		}
+	}
 
 	var lastScore int
-	for depth := 1; depth <= maxDepth; depth++ {
+	for ; depth <= maxDepth; depth++ {
 		score, ok := st.searchRoot(depth, lastScore)
 		if !ok {
 			// The iteration was abandoned; its result is not trustworthy, so
@@ -180,6 +271,7 @@ func (s *Searcher) Search(ctx context.Context, pos *chess.Position, limits Limit
 		lastScore = score
 
 		result.Best = st.pv[0][0]
+		result.Ponder = chess.MoveNone
 		if st.pvLength[0] > 1 {
 			result.Ponder = st.pv[0][1]
 		}
@@ -203,6 +295,7 @@ func (s *Searcher) Search(ctx context.Context, pos *chess.Position, limits Limit
 		}
 	}
 
+	st.flushNodes()
 	return result
 }
 
@@ -210,11 +303,15 @@ func (st *state) info(depth, score int, elapsed time.Duration) Info {
 	pv := make([]chess.Move, st.pvLength[0])
 	copy(pv, st.pv[0][:st.pvLength[0]])
 
+	// Node counts describe the whole search, not this thread's share, so that
+	// the figure a GUI displays matches the work actually done.
+	st.flushNodes()
+
 	info := Info{
 		Depth:    depth,
 		SelDepth: st.selDepth,
 		Score:    score,
-		Nodes:    st.nodes,
+		Nodes:    st.s.totalNodes.Load(),
 		Elapsed:  elapsed,
 		PV:       pv,
 		HashFull: st.s.tt.Hashfull(),
@@ -284,7 +381,9 @@ func (st *state) stopping() bool {
 	if st.ctx != nil && st.ctx.Err() != nil {
 		return true
 	}
-	if st.maxNodes > 0 && st.nodes >= st.maxNodes {
+	// The node limit counts every thread's work, so that "go nodes N" means the
+	// same amount of computation however many threads are configured.
+	if st.maxNodes > 0 && st.s.totalNodes.Load() >= st.maxNodes {
 		return true
 	}
 	if st.hardStop && time.Now().After(st.deadline) {
@@ -294,13 +393,23 @@ func (st *state) stopping() bool {
 }
 
 // checkStop is called periodically from the tree. Consulting the clock at every
-// node would cost more than the search saves, so it is sampled.
+// node would cost more than the search saves, so it is sampled — and the same
+// sampling point publishes this thread's node count to the shared total.
 func (st *state) checkStop() {
 	if st.nodes&2047 != 0 {
 		return
 	}
+	st.flushNodes()
 	if st.stopping() {
 		st.aborted = true
+	}
+}
+
+// flushNodes publishes the nodes searched since the last flush.
+func (st *state) flushNodes() {
+	if delta := st.nodes - st.reported; delta > 0 {
+		st.s.totalNodes.Add(delta)
+		st.reported = st.nodes
 	}
 }
 
