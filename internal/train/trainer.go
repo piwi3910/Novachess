@@ -315,8 +315,13 @@ func (t *Trainer) Train(ctx context.Context, samples []Sample) (*nnue.Network, S
 
 		shuffle(epochOrder, r)
 
+		// Losses are summed weighted by batch size rather than averaged over
+		// batches. The last batch of an epoch is usually short, and averaging
+		// per batch would give its few samples the same weight as a full
+		// batch's — enough to make the reported loss jump when the batch size
+		// changes even though nothing about the training did.
 		var epochLoss float64
-		var batches int
+		var counted int
 
 		for from := 0; from < len(epochOrder); from += t.params.BatchSize {
 			if ctx.Err() != nil {
@@ -333,12 +338,12 @@ func (t *Trainer) Train(ctx context.Context, samples []Sample) (*nnue.Network, S
 			loss := t.accumulateGradients(m, grad, data, batch, work)
 			opt.step(m, grad, len(batch))
 
-			epochLoss += loss
-			batches++
+			epochLoss += loss * float64(len(batch))
+			counted += len(batch)
 		}
 
-		if batches > 0 {
-			epochLoss /= float64(batches)
+		if counted > 0 {
+			epochLoss /= float64(counted)
 		}
 		stats.EpochLoss = append(stats.EpochLoss, epochLoss)
 		stats.TrainingLoss = epochLoss

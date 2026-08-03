@@ -93,11 +93,26 @@ func TestGradientsMatchNumericalDifferences(t *testing.T) {
 	grad.zero()
 	tr.accumulateGradients(m, grad, data, batch, work)
 
-	// The finite difference has to be large enough to survive float32 rounding
-	// in the forward pass and small enough that the curvature does not dominate.
+	// The step has to be large enough to survive float32 rounding in the
+	// forward pass and small enough that curvature does not dominate. Measured
+	// across the sampled parameters, the worst relative disagreement is 9.4e-3
+	// at h=1e-2, 6.4e-6 at h=1e-3 and 3.6e-5 at h=1e-4 — truncation dominates
+	// above, cancellation below, and the middle is the floor.
+	//
+	// The tolerance sits well above that floor but far below the size of a real
+	// mistake: the mutations this test is meant to catch disagree by 100% or
+	// more, not by fractions of a percent.
 	const h = 1e-3
-	const tolerance = 2e-2
+	const tolerance = 1e-3
 
+	// The reference loss is deliberately accumulated in float64 even though the
+	// trainer's own arithmetic rounds through float32. A finite difference
+	// subtracts two nearly equal numbers, so it loses precision exactly where
+	// the subtraction happens, and computing it in float32 makes it noisier
+	// rather than more faithful — measured, 3.4x worse at h=1e-3 and 6.3x worse
+	// at h=1e-4. The objective the analytic gradient belongs to does differ by
+	// float32 rounding, but that difference is about 1e-6 relative here, three
+	// orders of magnitude below the tolerance.
 	loss := func() float64 {
 		var total float64
 		for _, idx := range batch {
@@ -477,8 +492,8 @@ func TestResultWeightBlends(t *testing.T) {
 
 func TestTrainRejectsBadParams(t *testing.T) {
 	cases := []struct {
-		name  string
-		mutch func(*Params)
+		name   string
+		mutate func(*Params)
 	}{
 		{"no epochs", func(p *Params) { p.Epochs = 0 }},
 		{"no batch", func(p *Params) { p.BatchSize = 0 }},
@@ -492,7 +507,7 @@ func TestTrainRejectsBadParams(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p := testParams()
-			tc.mutch(&p)
+			tc.mutate(&p)
 			if _, err := NewTrainer(p); err == nil {
 				t.Error("accepted parameters it should have refused")
 			}
