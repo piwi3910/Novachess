@@ -84,8 +84,14 @@ type NATS struct {
 	ackWait time.Duration
 
 	// durable names this service's consumer for fan-out subscriptions, so its
-	// position survives a restart. Empty means ephemeral.
+	// position survives a restart. Empty means ephemeral. Ignored on
+	// fan-out subscriptions when replayAll is set.
 	durable string
+
+	// replayAll makes fan-out subscriptions use an ephemeral, DeliverAll
+	// consumer on every connection instead of a durable one that resumes
+	// past its acked position. See Config.ReplayAll.
+	replayAll bool
 
 	// maxInFlight caps unacknowledged messages per consumer — which for a queue
 	// group means across the whole group, since its members share one consumer.
@@ -206,6 +212,7 @@ func Connect(ctx context.Context, cfg Config) (*NATS, error) {
 		producer:    name,
 		ackWait:     DefaultAckWait,
 		durable:     cfg.Durable,
+		replayAll:   cfg.ReplayAll,
 		maxInFlight: inFlight,
 	}, nil
 }
@@ -354,8 +361,17 @@ func (n *NATS) subscribe(ctx context.Context, subject, queue string, h Handler) 
 	case queue != "":
 		// A named durable consumer shared by the group. Its position in the
 		// stream survives restarts, so a worker coming back does not replay
-		// units the group already finished.
+		// units the group already finished. Untouched by replayAll: that
+		// option is for fan-out subscriptions, and giving it to a queue
+		// group would mean every restart replaying already-played work.
 		cfg.Durable = consumerName(queue)
+	case n.replayAll:
+		// Ephemeral, and told explicitly to start from the beginning of
+		// what the stream still retains rather than the server's default
+		// of "from now on". Takes priority over n.durable: a caller that
+		// asked to replay everything wants exactly that on every
+		// reconnect, not a position that survives across them.
+		cfg.DeliverPolicy = jetstream.DeliverAllPolicy
 	case n.durable != "":
 		// A fan-out consumer belonging to this service alone, named so that it
 		// resumes rather than starting from the present. The subject is part of

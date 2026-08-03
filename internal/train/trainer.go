@@ -45,6 +45,12 @@ type Params struct {
 
 	// Seed fixes the shuffle and the weight initialization.
 	Seed uint64
+
+	// Progress, when non-nil, is called after each epoch with the 1-based
+	// epoch number and that epoch's mean training loss — the same value
+	// that ends up in Result.EpochLoss. It exists so a long training run
+	// can be watched while it happens rather than only summarized after.
+	Progress func(epoch int, loss float64)
 }
 
 // DefaultParams returns settings that train a usable network from a first
@@ -347,6 +353,10 @@ func (t *Trainer) Train(ctx context.Context, samples []Sample) (*nnue.Network, S
 		}
 		stats.EpochLoss = append(stats.EpochLoss, epochLoss)
 		stats.TrainingLoss = epochLoss
+
+		if t.params.Progress != nil {
+			t.params.Progress(epoch+1, epochLoss)
+		}
 		stats.Epochs = epoch + 1
 	}
 

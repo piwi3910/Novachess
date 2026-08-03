@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -105,6 +106,28 @@ func main() {
 	fmt.Fprintln(os.Stderr, report.Reason)
 	fmt.Fprintf(os.Stderr, "LOS %.1f%%, %d nodes searched in %v\n",
 		100*report.LOS, report.Nodes, report.Duration.Round(1e6))
+
+	verdictName := map[gate.Verdict]string{
+		gate.Accept: "promoted",
+		gate.Reject: "rejected",
+	}[report.Verdict]
+	if verdictName == "" {
+		verdictName = "inconclusive"
+	}
+	summary, _ := json.Marshal(map[string]any{
+		"verdict":    verdictName,
+		"wins":       report.Wins,
+		"losses":     report.Losses,
+		"draws":      report.Draws,
+		"games":      report.Games,
+		"elo_delta":  report.EloDelta,
+		"elo_margin": report.EloMargin,
+		"los":        report.LOS,
+		"reason":     report.Reason,
+	})
+	// One machine-readable line so a dashboard or script can read the
+	// outcome from the log without re-deriving it from the exit code.
+	fmt.Fprintf(os.Stderr, "RESULT %s\n", summary)
 
 	switch report.Verdict {
 	case gate.Accept:

@@ -50,6 +50,9 @@ func main() {
 	params.ResultWeight = *lambda
 	params.ValidationFraction = *holdout
 	params.Seed = *seed
+	params.Progress = func(epoch int, loss float64) {
+		fmt.Fprintf(os.Stderr, "  epoch %2d  loss %.6f\n", epoch, loss)
+	}
 
 	trainer, err := train.NewTrainer(params)
 	if err != nil {
@@ -172,10 +175,6 @@ func readAll(paths []string) ([]train.Sample, error) {
 func report(s train.Stats) {
 	fmt.Fprintf(os.Stderr, "trained on %d samples, held out %d, in %v\n",
 		s.TrainingSamples, s.ValidationSamples, s.Duration.Round(1e6))
-
-	for i, l := range s.EpochLoss {
-		fmt.Fprintf(os.Stderr, "  epoch %2d  loss %.6f\n", i+1, l)
-	}
 
 	fmt.Fprintf(os.Stderr, "final training loss %.6f, validation loss %.6f\n",
 		s.TrainingLoss, s.ValidationLoss)
