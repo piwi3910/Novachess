@@ -37,6 +37,35 @@ func (a *Accumulator) Refresh(n *Network, p *chess.Position) {
 	}
 }
 
+// RefreshFromFeatures rebuilds an accumulator from feature indices that have
+// already been computed, one list per perspective.
+//
+// The trainer works from precomputed index lists rather than positions, because
+// re-walking a board every epoch dominates a run. Giving it this entry point
+// means the comparison between a trained model and the network it quantized
+// into exercises the same weights through the same layout, isolating the
+// quantization from the feature indexing.
+func RefreshFromFeatures(a *Accumulator, n *Network, white, black []int32) {
+	for c := range a.values {
+		for i := 0; i < HiddenSize; i++ {
+			a.values[c][i] = int32(n.FeatureBias[i])
+		}
+	}
+
+	for _, list := range [2]struct {
+		features []int32
+		color    chess.Color
+	}{{white, chess.White}, {black, chess.Black}} {
+		half := &a.values[list.color]
+		for _, f := range list.features {
+			row := n.featureRow(int(f))
+			for i := 0; i < HiddenSize; i++ {
+				half[i] += int32(row[i])
+			}
+		}
+	}
+}
+
 // Add turns on the feature for a piece appearing on a square.
 func (a *Accumulator) Add(n *Network, piece chess.Piece, sq chess.Square) {
 	for c := chess.Color(0); c < chess.ColorCount; c++ {
