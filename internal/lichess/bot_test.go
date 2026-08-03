@@ -38,8 +38,16 @@ type fakeLichess struct {
 	declined map[string]string
 	chats    []string
 
+	// moveAttempts counts every move POST, including ones rejected with 429, so
+	// a test can wait for the attempt itself rather than for a wall-clock guess
+	// at how long a search takes.
+	moveAttempts int
 	// rateLimitMoves makes the next move POST return 429, once.
 	rateLimitMoves bool
+	// gameStreamOpens counts connections per game, for reconnection tests.
+	gameStreamOpens map[string]int
+	// dropGameStream closes a game stream immediately after the first message.
+	dropGameStream bool
 
 	server *httptest.Server
 }
@@ -48,10 +56,11 @@ func newFakeLichess(t *testing.T) *fakeLichess {
 	t.Helper()
 
 	f := &fakeLichess{
-		t:            t,
-		events:       make(chan string, 64),
-		gameMessages: make(map[string]chan string),
-		declined:     make(map[string]string),
+		t:               t,
+		events:          make(chan string, 64),
+		gameMessages:    make(map[string]chan string),
+		declined:        make(map[string]string),
+		gameStreamOpens: make(map[string]int),
 	}
 
 	mux := http.NewServeMux()
@@ -66,6 +75,23 @@ func newFakeLichess(t *testing.T) *fakeLichess {
 
 	mux.HandleFunc("/api/bot/game/stream/", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/bot/game/stream/")
+
+		f.mu.Lock()
+		f.gameStreamOpens[id]++
+		opens := f.gameStreamOpens[id]
+		drop := f.dropGameStream
+		f.mu.Unlock()
+
+		// Close the first connection immediately to imitate the mid-game
+		// disconnects Lichess produces routinely.
+		if drop && opens == 1 {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return
+		}
 		f.streamChannel(w, r, f.gameChannel(id))
 	})
 
@@ -78,6 +104,7 @@ func newFakeLichess(t *testing.T) *fakeLichess {
 		switch parts[1] {
 		case "move":
 			f.mu.Lock()
+			f.moveAttempts++
 			if f.rateLimitMoves {
 				f.rateLimitMoves = false
 				f.mu.Unlock()
@@ -179,6 +206,18 @@ func (f *fakeLichess) sendGame(id string, v any) {
 		f.t.Fatal(err)
 	}
 	f.gameChannel(id) <- string(b)
+}
+
+func (f *fakeLichess) attempts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.moveAttempts
+}
+
+func (f *fakeLichess) streamOpens(id string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gameStreamOpens[id]
 }
 
 func (f *fakeLichess) playedMoves() []string {
@@ -589,13 +628,133 @@ func TestRateLimitedMoveIsRetried(t *testing.T) {
 		State: GameState{Type: MessageGameState, Moves: "", WTime: 60000, BTime: 60000, Status: StatusStarted},
 	})
 
-	// The retry waits a full backoff period, which is a minute in production.
-	// This asserts the request was rejected and the bot did not treat that as
-	// success; the retry itself is covered by the code path rather than by
-	// waiting sixty seconds here.
-	time.Sleep(2 * time.Second)
+	// Wait for the POST itself rather than for a fixed duration. Asserting on a
+	// timer alone would pass even if the bot never got as far as posting, which
+	// would make this test prove nothing.
+	waitFor(t, 20*time.Second, "the move to be attempted", func() bool {
+		return f.attempts() >= 1
+	})
+
+	// The attempt was rejected, so nothing should have been recorded as played.
+	// The retry waits a full backoff period, a minute in production, so it is
+	// not waited out here.
 	if moves := f.playedMoves(); len(moves) != 0 {
 		t.Errorf("a rate-limited move was recorded as played: %v", moves)
+	}
+}
+
+// TestReconnectsAfterAGameStreamDrops covers the case that would otherwise lose
+// games silently. A game stream ending is not a game ending: Lichess closes
+// these routinely, and without reconnecting the bot would sit there not playing
+// while its clock ran down to a loss.
+func TestReconnectsAfterAGameStreamDrops(t *testing.T) {
+	f := newFakeLichess(t)
+	f.mu.Lock()
+	f.dropGameStream = true // the first connection closes immediately
+	f.mu.Unlock()
+
+	startBot(t, f, testConfig())
+
+	f.sendEvent(Event{Type: EventGameStart, Game: &GameEvent{ID: "drop"}})
+
+	waitFor(t, 20*time.Second, "the bot to reconnect the dropped stream", func() bool {
+		return f.streamOpens("drop") >= 2
+	})
+
+	// The reconnected stream replays the full state, and the bot must resume
+	// playing from it rather than treating the drop as the end of the game.
+	f.sendGame("drop", GameMessage{
+		Type: MessageGameFull, ID: "drop",
+		Variant: Variant{Key: VariantStandard}, InitialFEN: "startpos",
+		White: Player{ID: "novabot"}, Black: Player{ID: "human"},
+		State: GameState{Type: MessageGameState, Moves: "", WTime: 60000, BTime: 60000, Status: StatusStarted},
+	})
+
+	waitFor(t, 20*time.Second, "a move after reconnecting", func() bool {
+		return len(f.playedMoves()) >= 1
+	})
+}
+
+// TestDoesNotReconnectAfterTheGameEnds is the other half: once a finished
+// status has arrived, a closing stream is expected and must not be retried, or
+// the bot would reconnect to every game it has ever played forever.
+func TestDoesNotReconnectAfterTheGameEnds(t *testing.T) {
+	f := newFakeLichess(t)
+	startBot(t, f, testConfig())
+
+	f.sendEvent(Event{Type: EventGameStart, Game: &GameEvent{ID: "done"}})
+	f.sendGame("done", GameMessage{
+		Type: MessageGameFull, ID: "done",
+		Variant: Variant{Key: VariantStandard}, InitialFEN: "startpos",
+		White: Player{ID: "novabot"}, Black: Player{ID: "human"},
+		State: GameState{
+			Type: MessageGameState, Moves: "", WTime: 60000, BTime: 60000,
+			Status: "mate", Winner: "black",
+		},
+	})
+
+	waitFor(t, 10*time.Second, "the game stream to open", func() bool {
+		return f.streamOpens("done") >= 1
+	})
+
+	// Close the stream the way Lichess does when a game is over.
+	close(f.gameChannel("done"))
+
+	time.Sleep(2 * time.Second)
+	if opens := f.streamOpens("done"); opens > 1 {
+		t.Errorf("reconnected %d times to a finished game", opens)
+	}
+}
+
+// TestAcceptedChallengesCountAgainstCapacity checks the bound is enforced from
+// the moment a challenge is accepted, not from when its game starts. The gap
+// between the two is wide enough for a burst of challenges to all be accepted.
+func TestAcceptedChallengesCountAgainstCapacity(t *testing.T) {
+	f := newFakeLichess(t)
+	config := testConfig()
+	config.MaxConcurrentGames = 2
+	startBot(t, f, config)
+
+	newChallenge := func(id string) Event {
+		return Event{Type: EventChallenge, Challenge: &Challenge{
+			ID: id, Variant: Variant{Key: VariantStandard},
+			TimeControl: TimeControl{Type: "clock", Limit: 300},
+			Challenger:  Player{ID: "human"},
+		}}
+	}
+
+	// Three challenges, and crucially no gameStart events at all, so nothing
+	// ever lands in the running-games map.
+	for _, id := range []string{"a", "b", "c"} {
+		f.sendEvent(newChallenge(id))
+	}
+
+	waitFor(t, 10*time.Second, "all three challenges to be decided", func() bool {
+		decided := 0
+		for _, id := range []string{"a", "b", "c"} {
+			if f.wasAccepted(id) {
+				decided++
+				continue
+			}
+			if _, declined := f.declineReasonFor(id); declined {
+				decided++
+			}
+		}
+		return decided == 3
+	})
+
+	acceptedCount := 0
+	for _, id := range []string{"a", "b", "c"} {
+		if f.wasAccepted(id) {
+			acceptedCount++
+		}
+	}
+	if acceptedCount > config.MaxConcurrentGames {
+		t.Errorf("accepted %d challenges with a limit of %d; accepted challenges must hold a slot until their game starts",
+			acceptedCount, config.MaxConcurrentGames)
+	}
+	if acceptedCount == 0 {
+		t.Error("accepted nothing at all; the reservation is too aggressive")
 	}
 }
 

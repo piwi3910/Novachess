@@ -199,6 +199,9 @@ func (c *Client) stream(ctx context.Context, path string, fn func([]byte) error)
 		return err
 	}
 	c.authorize(req)
+	// Only the streams are NDJSON. Advertising it on ordinary endpoints risks a
+	// content-negotiation failure for no benefit.
+	req.Header.Set("Accept", "application/x-ndjson")
 
 	resp, err := c.streams.Do(req)
 	if err != nil {
@@ -264,7 +267,7 @@ func (c *Client) authorize(req *http.Request) {
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set("Accept", "application/json")
 }
 
 // statusError converts a non-2xx response into an error, singling out rate

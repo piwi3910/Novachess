@@ -71,6 +71,9 @@ type Bot struct {
 
 	mu      sync.Mutex
 	playing map[string]context.CancelFunc
+	// accepted holds challenges accepted but whose game has not started yet,
+	// so they count against the concurrency bound in the interval between.
+	accepted map[string]time.Time
 }
 
 // NewBot returns a bot using the given client.
@@ -82,10 +85,11 @@ func NewBot(client *Client, config Config, log *slog.Logger) *Bot {
 		config.MaxConcurrentGames = 1
 	}
 	return &Bot{
-		client:  client,
-		config:  config,
-		log:     log,
-		playing: make(map[string]context.CancelFunc),
+		client:   client,
+		config:   config,
+		log:      log,
+		playing:  make(map[string]context.CancelFunc),
+		accepted: make(map[string]time.Time),
 	}
 }
 
@@ -177,8 +181,13 @@ func (b *Bot) handleChallenge(ctx context.Context, ch Challenge) {
 
 	b.log.Info("accepting challenge", "id", ch.ID, "from", ch.Challenger.Name,
 		"variant", ch.Variant.Key, "rated", ch.Rated, "speed", ch.Speed)
+
+	// Reserve before the request, not after: two challenges arriving together
+	// would otherwise both see a free slot.
+	b.reserveSlot(ch.ID)
 	if err := b.client.AcceptChallenge(ctx, ch.ID); err != nil {
 		b.log.Warn("accept failed", "id", ch.ID, "error", err)
+		b.releaseSlot(ch.ID)
 	}
 }
 
@@ -188,6 +197,10 @@ func (b *Bot) declineReason(ch Challenge) (string, bool) {
 	if !b.variantSupported(ch.Variant.Key) {
 		return DeclineVariant, false
 	}
+	// Lichess decline reasons name what you *want*, not what you are refusing:
+	// "casual" renders as "Please send me a casual challenge instead." So a
+	// rated challenge is declined with DeclineCasual, which reads backwards and
+	// has been mistaken for a bug more than once.
 	if ch.Rated && !b.config.AcceptRated {
 		return DeclineCasual, false
 	}
@@ -206,15 +219,47 @@ func (b *Bot) declineReason(ch Challenge) (string, bool) {
 		}
 	}
 
+	// Capacity counts accepted-but-not-yet-started games as well as running
+	// ones. A slot only appears in playing when the gameStart event arrives,
+	// which is well after the accept, so counting only running games would let
+	// a burst of challenges all be accepted before any of them started.
 	b.mu.Lock()
-	atCapacity := len(b.playing) >= b.config.MaxConcurrentGames
+	inFlight := len(b.playing) + len(b.accepted)
 	b.mu.Unlock()
-	if atCapacity {
+	if inFlight >= b.config.MaxConcurrentGames {
 		return DeclineLater, false
 	}
 
 	return "", true
 }
+
+// reserveSlot records an accepted challenge so it counts against capacity
+// before its game begins. Lichess uses the challenge id as the game id, so the
+// reservation is released by the gameStart event for the same id.
+func (b *Bot) reserveSlot(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.accepted[id] = time.Now()
+
+	// Drop reservations whose game never materialised — a challenge can be
+	// accepted and then cancelled — so a lost accept cannot leak a slot for the
+	// lifetime of the process.
+	for other, at := range b.accepted {
+		if time.Since(at) > acceptedGameTimeout {
+			delete(b.accepted, other)
+		}
+	}
+}
+
+func (b *Bot) releaseSlot(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.accepted, id)
+}
+
+// acceptedGameTimeout bounds how long an accepted challenge holds a slot before
+// its game starts.
+const acceptedGameTimeout = 2 * time.Minute
 
 func (b *Bot) variantSupported(key string) bool {
 	for _, v := range b.config.AcceptVariants {
@@ -236,6 +281,9 @@ func (b *Bot) startGame(ctx context.Context, gameID string) {
 		b.mu.Unlock()
 		return
 	}
+	// The reservation made when the challenge was accepted is now redundant:
+	// the game itself holds the slot.
+	delete(b.accepted, gameID)
 	gameCtx, cancel := context.WithCancel(ctx)
 	b.playing[gameID] = cancel
 	b.mu.Unlock()
@@ -252,6 +300,7 @@ func (b *Bot) finishGame(gameID string) {
 	b.mu.Lock()
 	cancel, ok := b.playing[gameID]
 	delete(b.playing, gameID)
+	delete(b.accepted, gameID)
 	b.mu.Unlock()
 
 	if ok {
@@ -273,7 +322,17 @@ func (b *Bot) stopAllGames() {
 	}
 }
 
-// playGame drives one game to completion.
+// playGame drives one game to completion, reconnecting when the stream drops.
+//
+// A game stream ending is not the same as a game ending. Lichess closes these
+// streams routinely, and a game can easily outlive several connections; without
+// reconnecting, a mid-game disconnect would leave the bot silently not playing
+// while its clock ran down to a loss. The loop therefore ends only when the
+// game itself is over or the context is cancelled.
+//
+// Reconnecting is safe because the stream replays state: every connection
+// begins with a gameFull carrying the full move list, and the position is
+// rebuilt from it rather than carried across.
 func (b *Bot) playGame(ctx context.Context, gameID string) error {
 	g := &game{
 		bot:      b,
@@ -282,9 +341,42 @@ func (b *Bot) playGame(ctx context.Context, gameID string) error {
 	}
 	g.searcher.SetThreads(b.config.Threads)
 
-	return b.client.StreamGame(ctx, gameID, func(m GameMessage) error {
-		return g.handle(ctx, m)
-	})
+	backoff := time.Second
+	for ctx.Err() == nil {
+		err := b.client.StreamGame(ctx, gameID, func(m GameMessage) error {
+			return g.handle(ctx, m)
+		})
+
+		if ctx.Err() != nil {
+			break
+		}
+		if g.over {
+			return nil
+		}
+
+		switch {
+		case errors.Is(err, ErrRateLimited):
+			b.log.Warn("rate limited on a game stream", "game", gameID)
+			if !sleepCtx(ctx, RateLimitBackoff) {
+				return ctx.Err()
+			}
+		case err != nil:
+			b.log.Warn("game stream dropped, reconnecting",
+				"game", gameID, "error", err, "backoff", backoff)
+			if !sleepCtx(ctx, backoff) {
+				return ctx.Err()
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		default:
+			// A clean close mid-game still needs reconnecting, just without a
+			// penalty delay.
+			b.log.Debug("game stream closed, reconnecting", "game", gameID)
+			backoff = time.Second
+		}
+	}
+	return ctx.Err()
 }
 
 // game is the per-game state.
@@ -299,6 +391,9 @@ type game struct {
 	ourColor   chess.Color
 	started    bool
 	greeted    bool
+	// over records that the game reached a finished status, so a stream close
+	// after it is not mistaken for a disconnect worth reconnecting.
+	over bool
 }
 
 func (g *game) handle(ctx context.Context, m GameMessage) error {
@@ -374,6 +469,7 @@ func (g *game) maybeMove(ctx context.Context, state GameState) error {
 		return nil
 	}
 	if IsFinished(state.Status) {
+		g.over = true
 		g.bot.log.Info("game finished", "game", g.id, "status", state.Status, "winner", state.Winner)
 		return nil
 	}
