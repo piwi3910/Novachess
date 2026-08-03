@@ -26,6 +26,7 @@ the loop unattended across a cluster.
 | Evaluation, NNUE | network, inference and accumulator done |
 | Trainer | done |
 | Gatekeeper (SPRT match gating) | done |
+| Artifact storage | done |
 | Pipeline services (coordinator, worker) | not started |
 
 The engine plays. `go build ./cmd/novachess` produces a UCI binary that any
@@ -111,6 +112,7 @@ internal/eval/          evaluation
 internal/uci/           UCI protocol
 internal/lichess/       Lichess Bot API client
 internal/gate/          SPRT, match running, promotion decisions
+internal/store/         artifact storage for batches and networks
 internal/nnue/          trained evaluation: network, accumulator, inference
 internal/train/         self-play generation, packed data format, optimizer
 
@@ -389,6 +391,35 @@ Matches search by nodes and run one thread, for the same reasons self-play does:
 a match decided partly by which process got more CPU measures nothing, and a
 gating decision that cannot be reproduced cannot be audited when a promotion
 later looks like a mistake.
+
+## Artifact storage
+
+Pipeline messages carry references, not payloads. A batch of self-play positions
+is megabytes; putting it on the bus would make every message unloggable and
+every replay expensive, so the data goes to `internal/store` and the message
+carries a URI. On the cluster that is a shared volume across the boards' NVMe
+drives, which is enough for a pipeline this size and avoids running an object
+store for a few hundred gigabytes.
+
+**Writes are atomic.** Contents go to a temporary name and are flushed before
+being renamed into place, so a worker evicted mid-write leaves nothing rather
+than a prefix. A half-written batch is worse than a missing one: the trainer
+would read it, the final record would be truncated, and the resulting network
+would be quietly bad with nothing to point at.
+
+**Every artifact carries a checksum**, which travels in the message, so the
+trainer can prove it read what the worker wrote. Corruption between the two is
+exactly the failure this pipeline cannot detect downstream.
+
+**Keys are confined to the store, and not only arithmetically.** Keys derive
+from work unit IDs that arrive over the bus from a coordinator the worker did
+not authenticate, so a key that resolved outside the store would let a message
+dictate where a process writes. Every operation goes through an
+[`os.Root`](https://pkg.go.dev/os#Root) rather than through paths joined onto a
+prefix — because the volume is shared, and a lexical check that a joined path
+sits under the root is defeated by a symlink planted inside the store: the
+string comparison happens long before the kernel resolves the link. Nothing in
+this package creates symlinks, but anything else with access to the volume can.
 
 ## Running
 
