@@ -329,6 +329,43 @@ Then the trainer and gatekeeper Job specs need their gen0 paths bumped to gen1
 before the next round. That editing is exactly what section 8's first item
 replaces.
 
+### 5.5 Or from the dashboard
+
+Everything in 5.1–5.4 can also be done from the training dashboard instead of
+raw `kubectl`. Find its address:
+
+```bash
+kubectl -n novachess get svc novachess-dashboard
+```
+
+It is a `LoadBalancer` Service in front of `cmd/dashboard`, deployed by
+[dashboard.yaml](deploy/dashboard.yaml). Open the `EXTERNAL-IP` in a browser.
+It shows:
+
+- the 8 boards live, from the same heartbeats described in section 7 —
+  nodes/sec, current unit, and how stale each board's last heartbeat is
+- generation progress against the target, with positions/hour and an ETA
+- the trainer's loss per epoch, live, while a training Job is running
+- generation history — datasets, training runs, gate verdicts (including the
+  RESULT line the gatekeeper now prints, made machine-readable for exactly
+  this), and promotions — persisted at `/data/dashboard/history.jsonl` on the
+  shared PVC, so it survives the dashboard pod restarting
+
+It also has controls: pause/resume/stop/start self-play (this scales the
+worker Deployment), and launching a trainer or gatekeeper Job from the
+suspended CronJob templates with that generation's paths filled in for you
+instead of hand-edited.
+
+**The controls enforce the same rules a human operator has to remember by
+hand:** the coordinator is structurally clamped to 0 or 1 replicas — the
+dashboard cannot scale it to more than one no matter what is clicked — and
+advancing the generation is refused unless there is both a recorded promotion
+and the network file actually present on disk. It will not let you advance on
+a rejection, and it will not let you advance on a promotion whose network file
+somehow went missing. This is guardrail, not replacement: the underlying
+automation gap (section 8, item 1) is unchanged — a person still has to look
+at the dashboard and click.
+
 ---
 
 ## 6. The silent failures to check for
@@ -420,7 +457,12 @@ kubectl -n novachess scale deploy/novachess-coordinator --replicas=0
 **Heartbeats are not stored.** Workers publish to `nova.worker.heartbeat` over
 core NATS, deliberately not JetStream — a heartbeat is worth nothing a second
 later, and storing them would fill the stream with the one message type nobody
-replays. So you cannot read them back from a stream. To watch them live:
+replays. So you cannot read them back from a stream. **The dashboard (section
+5.5) is the normal way to watch them now** — it subscribes to the same subject
+and shows all 8 boards' nodes/sec and staleness at once, which is what you
+actually want when checking for a throttling board. The raw `nats sub` command
+below is the fallback for when the dashboard itself is down or you need to see
+the wire messages directly:
 
 ```bash
 kubectl -n novachess run nats-box --rm -it --image=natsio/nats-box -- \
@@ -509,21 +551,32 @@ structure was chosen for.
 ### 2. The coordinator should not restart into the generation it just finished
 
 Described in section 7. It exits 0 on completion and Kubernetes restarts it.
-Either it should wait for a promotion event and advance (which item 1 gives it
-for free), or, as a stopgap, block instead of exiting so the pod stays up
-without producing anything.
+The dashboard mitigates the operator burden — parking the coordinator while
+training is one click instead of remembering the `kubectl scale` command — but
+the underlying bug is unchanged: the coordinator itself still has no memory
+that it finished. Either it should wait for a promotion event and advance
+(which item 1 gives it for free), or, as a stopgap, block instead of exiting
+so the pod stays up without producing anything.
 
 ### 3. Per-generation paths in the Job specs
 
 [jobs.yaml](deploy/jobs.yaml) hardcodes `/data/gen0/` and
 `/data/networks/gen0.nnue`. Every generation currently requires editing that
-file. It should take the generation from an env var or from the dataset event.
+file by hand — unless you launch the Job from the dashboard, which computes
+the per-generation paths for you before creating it. That is a mitigation in
+the operator flow, not a fix: the Job specs on disk are still hardcoded to
+gen0, and anyone driving this with raw `kubectl` still has to edit the file.
+It should take the generation from an env var or from the dataset event.
 
-### 4. No monitoring
+### 4. No monitoring — partially addressed
 
-There are no metrics, no Prometheus endpoint, no alerts. Given how many of this
-system's failure modes are silent, this matters more here than in a typical
-service. The minimum worth having:
+There are still no Prometheus metrics and no alerts. What the dashboard
+(section 5.5) now covers, live and in one place: positions per second derived
+from heartbeats, generation progress against target, and gate verdicts and
+promotions from history. That closes the "can a human see what's happening"
+gap but not the "can a machine page someone" gap — there is still nothing to
+alert on a stall or a sick volume at 3am. The minimum still worth having as
+real metrics, not just a dashboard view:
 
 - positions per second, per worker and cluster-wide (heartbeats already carry
   nodes/sec — expose them)
