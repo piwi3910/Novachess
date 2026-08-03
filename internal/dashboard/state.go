@@ -77,7 +77,7 @@ func (s *State) NoteProgress(p GenProgress) {
 func (s *State) Snapshot(now time.Time) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := Snapshot{Generation: s.progress}
+	out := Snapshot{Generation: s.progress, Boards: []Board{}}
 	for _, b := range s.boards {
 		b.Stale = now.Sub(b.LastSeen) > StaleAfter
 		out.Boards = append(out.Boards, b)

@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// RefusedError marks a guardrail refusal - a request the controller
+// deliberately declines because acting on it would corrupt training state,
+// as opposed to a transport or cluster error. Callers (the HTTP layer) use
+// errors.As to tell the two apart and map refusals to 409 rather than 500.
+type RefusedError struct{ Reason string }
+
+func (e *RefusedError) Error() string { return e.Reason }
+
 // Controller performs the dashboard's control actions: pausing and resuming
 // self-play, launching trainer and gatekeeper jobs, and advancing the
 // coordinator to a new generation. It is the single place these actions are
@@ -78,7 +86,7 @@ func (ct *Controller) StartTrainer(ctx context.Context, generation int, force bo
 			return "", err
 		}
 		if replicas > 0 {
-			return "", fmt.Errorf("dashboard: coordinator is still running for generation %d; pass force to train anyway", generation)
+			return "", &RefusedError{Reason: fmt.Sprintf("dashboard: coordinator is still running for generation %d; pass force to train anyway", generation)}
 		}
 	}
 	jobName := fmt.Sprintf("train-gen%d-%d", generation, time.Now().Unix())
@@ -98,7 +106,7 @@ func (ct *Controller) StartTrainer(ctx context.Context, generation int, force bo
 func (ct *Controller) StartGatekeeper(ctx context.Context, generation int) (string, error) {
 	candidatePath := filepath.Join(ct.dataDir, "networks", fmt.Sprintf("gen%d.nnue", generation))
 	if _, err := os.Stat(candidatePath); err != nil {
-		return "", fmt.Errorf("dashboard: candidate network for generation %d not found: %w", generation, err)
+		return "", &RefusedError{Reason: fmt.Sprintf("dashboard: candidate network for generation %d not found: %v", generation, err)}
 	}
 	command := []string{"/usr/local/bin/gatekeeper", "-candidate", fmt.Sprintf("/data/networks/gen%d.nnue", generation)}
 	if generation > 0 {
@@ -121,7 +129,7 @@ func (ct *Controller) StartGatekeeper(ctx context.Context, generation int) (stri
 func (ct *Controller) AdvanceGeneration(ctx context.Context, toGeneration int) error {
 	from := toGeneration - 1
 	if !ct.history.HasPromotion(from) {
-		return fmt.Errorf("dashboard: generation %d has no recorded promotion, refusing to advance to %d", from, toGeneration)
+		return &RefusedError{Reason: fmt.Sprintf("dashboard: generation %d has no recorded promotion, refusing to advance to %d", from, toGeneration)}
 	}
 	networkFile := fmt.Sprintf("gen%d.nnue", from)
 	if _, err := os.Stat(filepath.Join(ct.dataDir, "networks", networkFile)); err != nil {
