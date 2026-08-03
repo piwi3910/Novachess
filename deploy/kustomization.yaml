@@ -14,5 +14,5 @@ resources:
 # Point this at your registry once the image is pushed.
 images:
   - name: novachess
-    newName: novachess
-    newTag: dev
+    newName: ghcr.io/piwi3910/novachess
+    newTag: b524b12

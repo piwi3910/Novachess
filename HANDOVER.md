@@ -129,49 +129,48 @@ If your storage class has a different name, change `storageClassName` in
 ### 3.2 A registry the cluster can pull from
 
 The manifests reference the image `novachess:dev`, which does not exist
-anywhere. You must build and push. See section 4.1.
+anywhere. CI builds and pushes the real image on every push — see section 4.1.
+The cluster must be able to pull from `ghcr.io`; if the package is private,
+the `novachess` namespace needs an image pull secret.
 
 ### 3.3 arm64
 
-The boards are Orange Pi, so `linux/arm64`. The image must be built for that
-platform. CI already cross-compiles on every push (the "Cross-compile for the
-cluster" job), so a broken arm64 build will not reach you — but the *image*
-still has to be built for the right architecture, and `docker build` on an
-x86 laptop will silently produce an amd64 image that fails with `exec format
-error` on the boards.
+The boards are Orange Pi, so `linux/arm64`. CI cross-compiles on every push
+(the "Cross-compile for the cluster" job) and the "Build and push image" job
+builds the image itself for `linux/arm64`, so an amd64-only image cannot reach
+you through CI. If you ever build locally instead, use `docker buildx build
+--platform linux/arm64` — a plain `docker build` on an x86 or Apple-silicon
+laptop will silently produce an image for the wrong platform that fails with
+`exec format error` on the boards.
 
 ---
 
 ## 4. Deploying
 
-### 4.1 Build and push the image
+### 4.1 The image
 
 One image contains all six binaries; each Deployment picks one with `command`.
 They share the whole engine, so building six images would multiply layers,
 pushes and version skew for nothing.
 
-```bash
-docker buildx build \
-  --platform linux/arm64 \
-  --build-arg VERSION="$(git describe --always --dirty)" \
-  -t YOUR_REGISTRY/novachess:v1 \
-  --push .
-```
-
-`VERSION` is stamped into every batch the workers produce, so a dataset can
-later be traced back to the build that generated it. Use a real version, not
-`dev`.
+CI's "Build and push image" job builds `linux/arm64` and pushes
+`ghcr.io/piwi3910/novachess:<version>` on every push, where `<version>` is
+`git describe --always --dirty` for the built commit. `VERSION` is stamped
+into every batch the workers produce, so a dataset can later be traced back
+to the build that generated it — which is also why the tag is the version
+rather than `latest` or `dev`.
 
 The Dockerfile asserts at build time that all six binaries exist, so a missing
 binary fails the build rather than the deployment.
 
-Then point the manifests at it in [kustomization.yaml](deploy/kustomization.yaml):
+Point the manifests at the pushed tag in
+[kustomization.yaml](deploy/kustomization.yaml):
 
 ```yaml
 images:
   - name: novachess
-    newName: YOUR_REGISTRY/novachess
-    newTag: v1
+    newName: ghcr.io/piwi3910/novachess
+    newTag: <version>
 ```
 
 ### 4.2 Apply
@@ -204,11 +203,24 @@ kubectl -n novachess get pvc novachess-data
 # STATUS must be Bound, ACCESS MODES must be RWX
 ```
 
-Then prove it is really shared — this is worth the two minutes:
+Then prove it is really shared — this is worth the two minutes. You cannot
+`kubectl exec ... ls` into the pipeline pods: the image is distroless/static
+and has no shell or coreutils. Mount the PVC from a throwaway pod instead:
 ```bash
-kubectl -n novachess exec deploy/novachess-coordinator -- ls /data
-# after workers have run, this must show gen0/ with files from multiple workers
+kubectl -n novachess run vol-check --restart=Never --image=busybox --overrides='
+{"spec":{"containers":[{"name":"vol-check","image":"busybox",
+  "command":["sh","-c","ls /data/gen0"],
+  "volumeMounts":[{"name":"data","mountPath":"/data"}]}],
+ "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"novachess-data"}}],
+ "restartPolicy":"Never"}}'
+kubectl -n novachess logs vol-check   # once Completed
+kubectl -n novachess delete pod vol-check
+# after workers have run, this must show batches from multiple workers
 ```
+The coordinator also proves sharing continuously: it checksum-verifies every
+batch (`store.Verify`) from a different node than the one that wrote it, so
+`counted a batch` lines naming several distinct workers are themselves
+evidence the volume is shared.
 
 **NATS up:**
 ```bash
@@ -354,8 +366,17 @@ rejected or empty stayed "in flight" forever. And a work unit whose games all
 ended inside the random opening produced zero positions, and the worker
 returned without announcing anything at all.
 
-**Check:** compare `issued` in the coordinator's log against batches counted.
-If `issued` is frozen while workers are idle, this is back.
+**Check:** the coordinator does not log issuance, so watch the work queue
+itself. On `curl -s localhost:8222/jsz?streams=true` (port-forward 8222 from
+`svc/nova-nats`), `NOVA_WORK`'s `last_seq` is the number of units ever issued
+and `messages` is the queue depth, which the coordinator keeps topped up to
+`NOVA_UNITS_IN_FLIGHT`. Healthy: `last_seq` climbing and depth steady at the
+ceiling. This failure mode: depth draining toward zero and `last_seq` frozen
+while workers sit idle and the counted total is below target. The unit IDs in
+`counted a batch` lines rising monotonically is the same signal from the log
+side. A unit that comes back empty is also logged now
+(`a unit produced no positions`), so the original silent variant of this
+stall would leave a trace.
 
 ### The trainer sees a fraction of the data
 
@@ -529,13 +550,7 @@ deployment. Note the constraint: the search shares one evaluator across lazy
 SMP threads, and the evaluator is currently stateless for that reason. Making
 the accumulator incremental means giving each search thread its own.
 
-### 7. No image build in CI
-
-CI runs tests, perft and a cross-compile, but does not build or push the
-container image. Every deploy is a manual `docker buildx` from a laptop, which
-means the image can drift from what was tested.
-
-### 8. Secrets and the Lichess bot
+### 7. Secrets and the Lichess bot
 
 `cmd/novabot` is not deployed by these manifests at all. When it is, it needs
 `LICHESS_TOKEN` as a Kubernetes Secret — it is supplied by env var and must
@@ -543,7 +558,7 @@ never be committed. Note also that `novabot -upgrade` irreversibly converts a
 Lichess account to a BOT account and requires an account that has never played
 a rated game.
 
-### 9. Backup
+### 8. Backup
 
 The PVC holds every generation of training data and every network. Longhorn
 supports recurring snapshots; none are configured. A million positions is
@@ -608,8 +623,8 @@ kubectl -n novachess run nats-box --rm -it --image=natsio/nats-box -- \
 kubectl -n novachess port-forward svc/nova-nats 8222:8222
 curl -s localhost:8222/jsz | jq
 
-# What is on the volume
-kubectl -n novachess exec deploy/novachess-coordinator -- ls -R /data
+# What is on the volume — the images are distroless, so exec has no `ls`;
+# mount the PVC from a throwaway busybox pod instead (see section 4.3)
 
 # Run a generation's trainer and gate
 kubectl -n novachess create job --from=cronjob/novachess-trainer   train-gen0

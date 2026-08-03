@@ -66,3 +66,39 @@ jobs:
       # than at deploy time.
       - name: Build arm64
         run: GOOS=linux GOARCH=arm64 go build ./...
+
+  image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    # Push events only: forked pull requests cannot write packages, and the
+    # test job already proves the code builds.
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # VERSION is stamped into every batch the workers produce, so a dataset
+      # can be traced back to the exact build that generated it.
+      - name: Version stamp
+        id: version
+        run: echo "version=$(git describe --always --dirty)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/novachess:${{ steps.version.outputs.version }}
