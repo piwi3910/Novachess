@@ -10,14 +10,30 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *FS {
 	t.Helper()
-	s, err := NewFS(t.TempDir())
+	return openStore(t, t.TempDir())
+}
+
+// openStore builds a store and closes it when the test ends. A store holds a
+// directory descriptor for as long as it lives — that is what confines it — so
+// a test that never closes one leaks a descriptor per store and, on platforms
+// where an open handle blocks deletion, leaves the temporary directory behind
+// too.
+func openStore(t *testing.T, dir string) *FS {
+	t.Helper()
+	s, err := NewFS(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("closing the store: %v", err)
+		}
+	})
 	return s
 }
 
@@ -172,10 +188,7 @@ func TestSymlinkedRootIsResolvedOnce(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	s, err := NewFS(link)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := openStore(t, link)
 	if s.Root() == link {
 		t.Error("the root was not resolved through the symlink")
 	}
@@ -609,4 +622,72 @@ func TestConcurrentWritesToOneKeyAreSafe(t *testing.T) {
 		}
 		t.Errorf("eight concurrent writes left %v", names)
 	}
+}
+
+// cancellingStore hands out a reader that cancels the context once reading has
+// begun, so a test can prove Verify stops part way rather than only before it
+// starts.
+type cancellingStore struct {
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (c *cancellingStore) Get(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(&cancellingReader{owner: c}), nil
+}
+
+func (c *cancellingStore) Put(context.Context, string, io.Reader) (Artifact, error) {
+	return Artifact{}, errors.New("not used")
+}
+func (c *cancellingStore) Stat(context.Context, string) (Artifact, error) {
+	return Artifact{}, errors.New("not used")
+}
+func (c *cancellingStore) Delete(context.Context, string) error { return errors.New("not used") }
+
+// cancellingReader never ends. If Verify ignored its context this would hang
+// rather than fail, which is the honest way to represent "reads a very large
+// artifact to the end".
+type cancellingReader struct{ owner *cancellingStore }
+
+func (r *cancellingReader) Read(p []byte) (int, error) {
+	r.owner.reads++
+	if r.owner.reads == 1 {
+		// Cancelled once reading is under way, not before it.
+		r.owner.cancel()
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+// TestVerifyStopsWhenCancelled checks that cancellation reaches inside the
+// read. An artifact is large by definition — that is why it is not on the bus —
+// so a Verify that only checked its context up front would keep reading a
+// gigabyte after the process was told to stop.
+func TestVerifyStopsWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &cancellingStore{cancel: cancel}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Verify(ctx, s, Artifact{URI: "file:///anything", Size: 1 << 40, Checksum: "unused"})
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Verify returned %v, want the cancellation", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Verify did not stop when its context was cancelled")
+	}
+
+	// It stopped early rather than reading the whole endless stream.
+	if s.reads > 100 {
+		t.Errorf("Verify made %d reads after cancellation; it should have stopped at the next one", s.reads)
+	}
+	t.Logf("stopped after %d reads", s.reads)
 }

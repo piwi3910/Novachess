@@ -107,6 +107,24 @@ func ValidateKey(key string) error {
 	return nil
 }
 
+// readerWithContext stops a read when its context is done.
+//
+// io.Copy has no notion of cancellation, so a long read is otherwise
+// uninterruptible however carefully the context was threaded to it. Checking
+// once per Read costs an atomic load against buffers of tens of kilobytes,
+// which is nothing next to the disk.
+type readerWithContext struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c readerWithContext) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 // checksummer wraps a reader, accumulating the hash and length as it is read.
 type checksummer struct {
 	r    io.Reader
@@ -135,6 +153,11 @@ func (c *checksummer) sum() string { return hex.EncodeToString(c.h.Sum(nil)) }
 // dataset from batches it never verified would produce a network from whatever
 // the disks happened to return, and no amount of care in the training code
 // would notice.
+// Cancellation is honoured throughout the read, not merely before it. An
+// artifact is the whole point of this package being separate from the bus —
+// it is large — so a Verify that only checked its context up front would run
+// to completion on a gigabyte of data after the process had been told to stop,
+// which is the difference between a pod shutting down and a pod being killed.
 func Verify(ctx context.Context, s Store, want Artifact) error {
 	rc, err := s.Get(ctx, want.URI)
 	if err != nil {
@@ -142,8 +165,11 @@ func Verify(ctx context.Context, s Store, want Artifact) error {
 	}
 	defer rc.Close()
 
-	c := newChecksummer(rc)
+	c := newChecksummer(readerWithContext{ctx: ctx, r: rc})
 	if _, err := io.Copy(io.Discard, c); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("store: reading %s: %w", want.URI, err)
 	}
 
