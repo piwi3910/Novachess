@@ -377,6 +377,12 @@ func (e *Engine) perft(args []string) {
 			depth = d
 		}
 	}
+	// PerftDivide searches depth-1 below each root move, and Perft returns 1
+	// at depth zero or less, so a non-positive depth would silently produce a
+	// depth-1 divide and report it under the depth the user asked for.
+	if depth < 1 {
+		depth = 1
+	}
 
 	p := e.currentPosition()
 	start := time.Now()
@@ -389,8 +395,18 @@ func (e *Engine) perft(args []string) {
 	}
 
 	elapsed := time.Since(start)
-	e.sendf("nodes %d time %d nps %d", total, elapsed.Milliseconds(),
-		int64(float64(total)/elapsed.Seconds()))
+	e.sendf("nodes %d time %d nps %d", total, elapsed.Milliseconds(), nodesPerSecond(total, elapsed))
+}
+
+// nodesPerSecond computes a rate, returning zero rather than dividing by a
+// duration that rounded to nothing. A shallow perft on a fast machine really
+// can finish inside the clock's resolution, and converting the resulting
+// infinity to an integer is undefined in Go — it would print a garbage number.
+func nodesPerSecond(nodes uint64, elapsed time.Duration) uint64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint64(float64(nodes) / elapsed.Seconds())
 }
 
 // currentPosition returns a copy of the engine's position, so that a running

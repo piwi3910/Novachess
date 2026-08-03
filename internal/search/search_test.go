@@ -60,9 +60,11 @@ func TestFindsForcedMate(t *testing.T) {
 			wantMove:   "b1b8",
 		},
 		{
-			// Black is mated; the score from White's side to move must be a
-			// mate in two.
-			name:       "mate in two",
+			// The same back-rank mate found at greater depth, and with White's
+			// own pawns on the board so the position is not a bare endgame.
+			// Still mate in one; the point is that extra depth does not make
+			// the engine prefer a slower mate.
+			name:       "back rank mate found at depth five",
 			fen:        "6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1",
 			depth:      5,
 			wantMateIn: 1,
@@ -90,8 +92,9 @@ func TestFindsForcedMate(t *testing.T) {
 // TestDetectsBeingMated checks the losing side of the same coin. An engine that
 // cannot recognise it is being mated will not try to avoid it.
 func TestDetectsBeingMated(t *testing.T) {
-	// White is a queen down with mate coming; the score must be strongly
-	// negative.
+	// Black is to move and a queen up with an attack. Scores are from the side
+	// to move's perspective, so the winning side seeing a win means a strongly
+	// positive number here, not a negative one.
 	_, res := searchDepth(t, "6k1/5ppp/8/8/8/7q/5PPP/6K1 b - - 0 1", 5)
 	if res.Info.Score < 500 {
 		t.Errorf("Black to move with a winning attack: score = %d, want clearly positive", res.Info.Score)

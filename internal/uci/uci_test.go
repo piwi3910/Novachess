@@ -3,6 +3,7 @@ package uci
 import (
 	"bytes"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,14 +17,13 @@ import (
 // is deliberate: the protocol's hardest requirement is that input keeps being
 // read during a search, and only the loop can demonstrate that.
 type driver struct {
-	t       *testing.T
-	in      io.WriteCloser
-	lines   chan string
-	done    chan struct{}
-	mu      sync.Mutex
-	all     []string
-	engine  *Engine
-	scanner *bytes.Buffer
+	t      *testing.T
+	in     io.WriteCloser
+	lines  chan string
+	done   chan struct{}
+	mu     sync.Mutex
+	all    []string
+	engine *Engine
 }
 
 func newDriver(t *testing.T) *driver {
@@ -288,6 +288,56 @@ func TestUcinewgameResetsState(t *testing.T) {
 	line := d.expect("rnbqkbnr/pppppppp", 2*time.Second)
 	if !strings.Contains(line, "w KQkq") {
 		t.Errorf("board after ucinewgame = %q, want the starting position", line)
+	}
+}
+
+// TestPerftClampsNonPositiveDepth covers a command that previously lied. Perft
+// returns 1 at depth zero or less and PerftDivide searches one ply below the
+// root, so "perft 0" produced a depth-1 divide and labelled it as depth 0.
+func TestPerftClampsNonPositiveDepth(t *testing.T) {
+	d := newDriver(t)
+	defer d.close()
+
+	d.send("position startpos")
+
+	for _, depth := range []string{"perft 0", "perft -3"} {
+		d.send(depth)
+		line := d.expect("nodes ", 5*time.Second)
+
+		// Clamped to depth 1, the starting position has twenty legal moves.
+		if !strings.HasPrefix(line, "nodes 20 ") {
+			t.Errorf("%q reported %q, want a depth-1 divide of 20 nodes", depth, line)
+		}
+	}
+}
+
+// TestPerftReportsRateWithoutDividingByZero guards the nps computation. A
+// shallow perft really can finish inside the clock's resolution, and converting
+// the resulting infinity to an integer is undefined in Go.
+func TestPerftReportsRateWithoutDividingByZero(t *testing.T) {
+	d := newDriver(t)
+	defer d.close()
+
+	d.send("position startpos")
+	d.send("perft 1")
+
+	line := d.expect("nodes ", 5*time.Second)
+	fields := strings.Fields(line)
+	nps := fields[len(fields)-1]
+	if _, err := strconv.ParseUint(nps, 10, 64); err != nil {
+		t.Errorf("nps field %q is not a plain integer: %v (line %q)", nps, err, line)
+	}
+}
+
+func TestNodesPerSecondHandlesZeroElapsed(t *testing.T) {
+	if got := nodesPerSecond(1000, 0); got != 0 {
+		t.Errorf("nodesPerSecond with zero elapsed = %d, want 0", got)
+	}
+	if got := nodesPerSecond(1000, -time.Second); got != 0 {
+		t.Errorf("nodesPerSecond with negative elapsed = %d, want 0", got)
+	}
+	if got := nodesPerSecond(1000, time.Second); got != 1000 {
+		t.Errorf("nodesPerSecond = %d, want 1000", got)
 	}
 }
 
