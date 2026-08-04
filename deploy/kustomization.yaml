@@ -16,4 +16,4 @@ resources:
 images:
   - name: novachess
     newName: ghcr.io/piwi3910/novachess
-    newTag: e7d2058
+    newTag: 786d8df
