@@ -105,13 +105,25 @@ func nnueIncremental(t *testing.T, net *nnue.Network) eval.Evaluator {
 }
 
 // searchFixedDepth runs a fixed-depth, single-threaded search with the given
-// evaluator and returns the node count and best move.
-func searchFixedDepth(t *testing.T, fen string, depth int, evaluator eval.Evaluator) (uint64, chess.Move) {
+// evaluator and returns the node count, score and best move.
+func searchFixedDepth(t *testing.T, fen string, depth int, evaluator eval.Evaluator) (uint64, int, chess.Move) {
 	t.Helper()
 	p := mustParse(t, fen)
 	s := New(evaluator, 16)
 	res := s.Search(context.Background(), p, Limits{Depth: depth}, nil)
-	return res.Info.Nodes, res.Best
+	return res.Info.Nodes, res.Info.Score, res.Best
+}
+
+// searchFixedNodes is searchFixedDepth's node-budgeted counterpart. The gate
+// and the self-play workers both search to a node limit, never a depth, so
+// the behaviour-neutral proof has to hold in that shape too, not only the one
+// unit tests find convenient.
+func searchFixedNodes(t *testing.T, fen string, nodes uint64, evaluator eval.Evaluator) (uint64, int, chess.Move) {
+	t.Helper()
+	p := mustParse(t, fen)
+	s := New(evaluator, 16)
+	res := s.Search(context.Background(), p, Limits{Nodes: nodes}, nil)
+	return res.Info.Nodes, res.Info.Score, res.Best
 }
 
 // TestIncrementalSearchIsBehaviourNeutral is the CLAUDE.md-mandated proof:
@@ -146,12 +158,26 @@ func TestIncrementalSearchIsBehaviourNeutral(t *testing.T) {
 
 	for _, fen := range fens {
 		t.Run(fen, func(t *testing.T) {
-			nodesInc, moveInc := searchFixedDepth(t, fen, 6, nnueIncremental(t, net))
-			nodesRef, moveRef := searchFixedDepth(t, fen, 6, nnueRefreshOnly(net))
+			nodesInc, scoreInc, moveInc := searchFixedDepth(t, fen, 6, nnueIncremental(t, net))
+			nodesRef, scoreRef, moveRef := searchFixedDepth(t, fen, 6, nnueRefreshOnly(net))
 
-			if nodesInc != nodesRef || moveInc != moveRef {
-				t.Fatalf("%s: incremental (nodes %d, move %v) diverged from refresh (nodes %d, move %v)",
-					fen, nodesInc, moveInc, nodesRef, moveRef)
+			if nodesInc != nodesRef || moveInc != moveRef || scoreInc != scoreRef {
+				t.Fatalf("%s: incremental (nodes %d, move %v, score %d) diverged from refresh (nodes %d, move %v, score %d)",
+					fen, nodesInc, moveInc, scoreInc, nodesRef, moveRef, scoreRef)
+			}
+		})
+
+		// The same proof, node-limited rather than depth-limited: this is the
+		// shape the gate and the self-play workers actually search in, and
+		// nothing about driving the accumulator by delta instead of a full
+		// refresh should depend on which kind of limit stopped the search.
+		t.Run(fen+"/fixed-nodes", func(t *testing.T) {
+			nodesInc, scoreInc, moveInc := searchFixedNodes(t, fen, 20000, nnueIncremental(t, net))
+			nodesRef, scoreRef, moveRef := searchFixedNodes(t, fen, 20000, nnueRefreshOnly(net))
+
+			if nodesInc != nodesRef || moveInc != moveRef || scoreInc != scoreRef {
+				t.Fatalf("%s: incremental (nodes %d, move %v, score %d) diverged from refresh (nodes %d, move %v, score %d)",
+					fen, nodesInc, moveInc, scoreInc, nodesRef, moveRef, scoreRef)
 			}
 		})
 	}
