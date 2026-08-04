@@ -40,6 +40,16 @@ spec:
                 - "1024"
                 - -lr
                 - "0.001"
+                # Weight the game's outcome over the search's own score. At
+                # 0.5 half the training signal is the evaluation that played
+                # the games, so the network learns to imitate its teacher and
+                # approaches it from below rather than passing it - which is
+                # what generation zero's gates measured: -446, -196, -44 Elo
+                # against the hand-crafted evaluation, closing but never
+                # crossing. The outcome is noisier but it is the only signal
+                # that can exceed the player that generated it.
+                - -result-weight
+                - "0.8"
                 - -lr-drops
                 - "8,12"
                 - -init
