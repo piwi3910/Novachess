@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -250,6 +251,50 @@ func (f *FS) Stat(ctx context.Context, uri string) (Artifact, error) {
 	}
 
 	return Artifact{URI: uri, Size: info.Size()}, nil
+}
+
+// List returns the URIs of every artifact directly under a key prefix,
+// sorted.
+//
+// Only files are returned, not subdirectories: a prefix names a generation's
+// directory, and nothing in this store nests one artifact directory inside
+// another.
+func (f *FS) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ValidateKey(prefix); err != nil {
+		return nil, err
+	}
+
+	dir, err := f.root.Open(prefix)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: listing %s: %w", prefix, err)
+	}
+	defer dir.Close()
+
+	entries, err := dir.ReadDir(-1)
+	if err != nil {
+		return nil, fmt.Errorf("store: listing %s: %w", prefix, err)
+	}
+
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		keys = append(keys, path.Join(prefix, e.Name()))
+	}
+	sort.Strings(keys)
+
+	uris := make([]string, len(keys))
+	for i, key := range keys {
+		uris[i] = f.URI(key)
+	}
+	return uris, nil
 }
 
 // Delete removes an artifact. A missing one is not an error, so cleaning up

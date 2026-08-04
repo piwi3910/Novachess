@@ -16,12 +16,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/piwi3910/novachess/internal/bus"
 	"github.com/piwi3910/novachess/internal/events"
 	"github.com/piwi3910/novachess/internal/store"
+	"github.com/piwi3910/novachess/internal/train"
 )
 
 // Config describes how a generation is run.
@@ -124,6 +128,16 @@ type Coordinator struct {
 	generation int
 	done       chan struct{}
 	closeOnce  sync.Once
+
+	// nextIndex is the next unit index to consider issuing. It walks forward
+	// independently of issued, which counts only units actually published,
+	// because a resumed generation must skip indices already covered on disk
+	// without renumbering the ones still missing.
+	nextIndex int
+	// covered marks unit indices satisfied by an artifact found on disk at
+	// startup, so topUp knows to step over them rather than reissue and
+	// replay work that already succeeded.
+	covered map[int]bool
 }
 
 // New returns a coordinator.
@@ -144,6 +158,7 @@ func New(cfg Config, b bus.Bus, s store.Store, log *slog.Logger) (*Coordinator, 
 		store:      s,
 		log:        log,
 		resolved:   make(map[string]bool),
+		covered:    make(map[int]bool),
 		generation: cfg.Generation,
 		done:       make(chan struct{}),
 	}, nil
@@ -163,10 +178,33 @@ func (c *Coordinator) RunGeneration(ctx context.Context) (Progress, error) {
 	}
 	defer sub.Close()
 
+	// Before issuing anything, find out what an earlier run of this generation
+	// already produced. Skipping this would replay every unit from zero on
+	// every restart — hours of byte-identical work for a generation that
+	// extends across a deploy.
+	if err := c.resume(ctx); err != nil {
+		return c.progress(), err
+	}
+
 	c.log.Info("starting a generation",
 		"generation", c.generation,
 		"target", c.cfg.PositionsPerGeneration,
 		"network", networkName(c.cfg.NetworkURI))
+
+	c.mu.Lock()
+	alreadyReached := c.positions >= c.cfg.PositionsPerGeneration
+	c.mu.Unlock()
+
+	// The artifacts already on disk are enough on their own. Announce and stop
+	// here: issuing work now would ask for positions nobody needs.
+	if alreadyReached {
+		progress := c.progress()
+		if err := c.announce(ctx); err != nil {
+			return progress, err
+		}
+		progress.Complete = true
+		return progress, nil
+	}
 
 	// Fill the queue before waiting, so workers have something to do the
 	// moment they connect.
@@ -282,33 +320,163 @@ func (c *Coordinator) topUp(ctx context.Context) error {
 	// that contributed data. A unit that failed verification or produced no
 	// positions is finished; counting it as still in flight would shrink the
 	// queue with every such unit until the coordinator stopped issuing work and
-	// the generation hung with idle workers.
+	// the generation hung with idle workers. Units resumed from disk are
+	// counted the same way here: resume marks them resolved and bumps issued
+	// to match, so they contribute nothing outstanding either.
 	c.mu.Lock()
 	outstanding := c.issued - len(c.resolved)
 	needed := c.cfg.UnitsInFlight - outstanding
 	c.mu.Unlock()
 
-	for i := 0; i < needed; i++ {
+	issuedThisCall := 0
+	for issuedThisCall < needed {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
+		// Walk forward over unit indices, stepping over any already covered by
+		// an artifact found on disk at startup. Skipping does not count against
+		// needed: it is the count of new units issued that must reach it, not
+		// the count of indices considered.
 		c.mu.Lock()
-		index := c.issued
-		c.issued++
+		index := c.nextIndex
+		c.nextIndex++
+		skip := c.covered[index]
 		c.mu.Unlock()
+
+		if skip {
+			continue
+		}
 
 		unit := c.unit(index)
 		if err := c.bus.Publish(ctx, events.SubjectWorkAssign, unit); err != nil {
-			// Give the number back, so the next attempt reuses it rather than
-			// leaving a gap that makes the issued count a lie.
+			// Give the index back, so the next attempt reuses it rather than
+			// leaving a gap that renumbers every unit after it.
 			c.mu.Lock()
-			c.issued--
+			c.nextIndex--
 			c.mu.Unlock()
 			return fmt.Errorf("coordinator: issuing work: %w", err)
 		}
+
+		c.mu.Lock()
+		c.issued++
+		c.mu.Unlock()
+		issuedThisCall++
 	}
 	return nil
+}
+
+// resume scans the generation's artifact directory for units an earlier run
+// already produced, so a restart resumes a generation rather than replaying
+// it — reissuing every unit from zero costs hours of byte-identical self-play
+// per extension of a long generation.
+//
+// A file that does not parse as this generation's unit naming is not one of
+// ours and is left alone. A file that fails to read as a valid, complete data
+// file counts as absent rather than present, and its unit is reissued: a
+// truncated artifact left by a worker evicted mid-write is indistinguishable
+// from one that was never written, and trusting it would silently drop its
+// positions out of the dataset forever.
+func (c *Coordinator) resume(ctx context.Context) error {
+	uris, err := c.store.List(ctx, fmt.Sprintf("gen%d", c.generation))
+	if err != nil {
+		return fmt.Errorf("coordinator: scanning for existing artifacts: %w", err)
+	}
+
+	var positions, count int
+	for _, uri := range uris {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		index, ok := c.unitIndex(uri)
+		if !ok {
+			continue
+		}
+
+		n, err := c.countPositions(ctx, uri)
+		if err != nil {
+			c.log.Warn("discarding an existing artifact that does not validate",
+				"error", err, "artifact", uri)
+			continue
+		}
+
+		unitID := c.unit(index).ID
+
+		c.mu.Lock()
+		if !c.resolved[unitID] {
+			c.resolved[unitID] = true
+			c.covered[index] = true
+			c.artifacts = append(c.artifacts, uri)
+			c.positions += n
+			// issued is bumped in step with resolved so this unit contributes
+			// nothing to topUp's outstanding count: it was never issued this
+			// run, and none of the queue's capacity should be spent waiting on
+			// it.
+			c.issued++
+			positions += n
+			count++
+		}
+		c.mu.Unlock()
+	}
+
+	if count > 0 {
+		c.log.Info("resumed a generation",
+			"generation", c.generation,
+			"positions", positions,
+			"artifacts", count)
+	}
+	return nil
+}
+
+// unitIndex extracts a unit's index from where its artifact would be stored,
+// the inverse of the naming unit builds. A name that does not match this
+// generation's pattern is ignored rather than guessed at — it did not come
+// from this coordinator, or belongs to a different generation's directory.
+func (c *Coordinator) unitIndex(uri string) (int, bool) {
+	base := path.Base(uri)
+	name, ok := strings.CutSuffix(base, train.FileExtension)
+	if !ok {
+		return 0, false
+	}
+
+	prefix := fmt.Sprintf("g%d-u", c.generation)
+	digits, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return 0, false
+	}
+
+	index, err := strconv.Atoi(digits)
+	// The round trip through the same zero-padded width the coordinator uses
+	// to build IDs rejects anything that merely looks similar, such as an
+	// index with a different number of digits.
+	if err != nil || index < 0 || fmt.Sprintf("%06d", index) != digits {
+		return 0, false
+	}
+	return index, true
+}
+
+// countPositions reads an artifact end to end and returns how many samples it
+// holds, proving along the way that it decodes cleanly. A truncated or
+// otherwise corrupt file surfaces as an error here rather than a plausible
+// count, so resume treats it as absent instead of trusting a number that
+// was never really there.
+func (c *Coordinator) countPositions(ctx context.Context, uri string) (int, error) {
+	rc, err := c.store.Get(ctx, uri)
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+
+	reader, err := train.NewReader(rc)
+	if err != nil {
+		return 0, err
+	}
+	samples, err := reader.ReadAll()
+	if err != nil {
+		return 0, err
+	}
+	return len(samples), nil
 }
 
 // unit builds the nth work unit of this generation.

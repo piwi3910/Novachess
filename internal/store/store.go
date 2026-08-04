@@ -65,6 +65,15 @@ type Store interface {
 	// Delete removes an artifact. Missing artifacts are not an error, so that
 	// cleaning up after a failed generation is idempotent.
 	Delete(ctx context.Context, uri string) error
+
+	// List returns the URIs of every artifact stored directly under a key
+	// prefix, sorted. It is how a coordinator resuming a generation discovers
+	// what a previous run already wrote, without knowing any names in advance.
+	//
+	// A prefix that does not exist is not an error and yields no results: a
+	// generation that has not produced anything yet looks exactly like one
+	// that never started, and both resume the same way.
+	List(ctx context.Context, prefix string) ([]string, error)
 }
 
 // ValidateKey checks that a key is safe to use as a storage location.
