@@ -86,6 +86,15 @@ func New(s SPRT, m MatchConfig) (*Gate, error) {
 // single-threaded searchers, from an opening that is a pure function of its
 // index, still is. Only the stopping point moves; the promotion decision it
 // protects does not become less reliable for arriving sooner.
+//
+// The verdict itself latches once reached (see fold): up to Concurrency-1
+// other pairs can still be in flight at that instant, and their results are
+// delivered afterwards while runPairs is cancelling and draining them. A
+// verdict recomputed on every arrival would let one of those stragglers pull
+// the LLR back inside the band and turn a legitimately crossed verdict into
+// Inconclusive - which is exactly backwards: the SPRT's stopping rule is a
+// decision made at the moment of crossing, not a running summary that keeps
+// being revised.
 func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (Report, error) {
 	var report Report
 	report.Lower, report.Upper = g.sprt.Bounds()
@@ -118,19 +127,40 @@ func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (R
 	// whatever pairs are still in flight and drains their results before this
 	// function returns.
 	err := runPairs(ctx, candidate, incumbent, g.match, pairs, func(r pairResult) bool {
-		report.Wins += r.wins
-		report.Losses += r.losses
-		report.Draws += r.draws
-		report.Games += r.wins + r.losses + r.draws
-		report.Nodes += r.nodes
-
-		verdict, llr := g.sprt.Test(report.Wins, report.Losses, report.Draws)
-		report.Verdict, report.LLR = verdict, llr
-
-		return verdict != Inconclusive
+		return fold(&report, g.sprt, r)
 	})
 
 	return finish(err)
+}
+
+// fold merges one pair's result into report and, if the verdict is not yet
+// decided, tests it against the SPRT bounds.
+//
+// Wins, Losses, Draws, Games and Nodes always fold in every pair delivered,
+// including stragglers that arrive after a verdict - the report's tally
+// stays an honest count of every game actually played, whether or not it
+// still moves the decision. Verdict and LLR are different: once Verdict is
+// no longer Inconclusive it latches, and neither field is touched again. That
+// is what makes the stopping decision stick at the pair that actually crossed
+// a bound, rather than at whichever pair happened to be folded in last.
+//
+// fold reports whether the match is decided, so the caller can keep using its
+// return value as runPairs' stop signal after the latch as before.
+func fold(report *Report, sprt SPRT, r pairResult) bool {
+	report.Wins += r.wins
+	report.Losses += r.losses
+	report.Draws += r.draws
+	report.Games += r.wins + r.losses + r.draws
+	report.Nodes += r.nodes
+
+	if report.Verdict != Inconclusive {
+		return true
+	}
+
+	verdict, llr := sprt.Test(report.Wins, report.Losses, report.Draws)
+	report.Verdict, report.LLR = verdict, llr
+
+	return verdict != Inconclusive
 }
 
 // explain puts the decision into a sentence, including the numbers that would

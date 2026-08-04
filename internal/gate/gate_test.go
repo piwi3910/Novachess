@@ -227,6 +227,56 @@ func TestInconclusiveIsNotAPromotion(t *testing.T) {
 	}
 }
 
+// TestVerdictLatchesAfterCrossing drives fold directly, rather than through a
+// live match, so the arrival order that matters - a crossing followed by
+// contrary stragglers - is exact rather than left to goroutine scheduling.
+// Without the latch in fold, the straggler losses folded in after the
+// crossing would pull the LLR back inside the band and flip Verdict back to
+// Inconclusive; runPairs can deliver exactly this shape, since up to
+// Concurrency-1 pairs may still be in flight - and still report their result -
+// at the instant one of them crosses a bound.
+func TestVerdictLatchesAfterCrossing(t *testing.T) {
+	s := SPRT{Elo0: 0, Elo1: 200, Alpha: 0.05, Beta: 0.05}
+	var report Report
+	report.Lower, report.Upper = s.Bounds()
+
+	// Fold decisive wins until the upper bound is crossed.
+	var crossed bool
+	for i := 0; i < 50 && !crossed; i++ {
+		crossed = fold(&report, s, pairResult{wins: 2})
+	}
+	if !crossed || report.Verdict != Accept {
+		t.Fatalf("setup did not cross the upper bound: verdict %v llr %v", report.Verdict, report.LLR)
+	}
+	crossedLLR := report.LLR
+	crossedGames := report.Games
+
+	// A straggler pair that is a pure loss for the candidate, arriving after
+	// the crossing - exactly what an in-flight pair can deliver once runPairs
+	// has already reported the crossing pair upstream.
+	stop := fold(&report, s, pairResult{losses: 2})
+
+	if !stop {
+		t.Error("fold did not keep reporting the match as decided once the verdict had latched")
+	}
+	if report.Verdict != Accept {
+		t.Errorf("verdict flipped to %v after a contrary straggler; a crossed verdict must stick", report.Verdict)
+	}
+	if report.LLR != crossedLLR {
+		t.Errorf("LLR moved from %v to %v after the latch; it must stay at the value it crossed on", crossedLLR, report.LLR)
+	}
+
+	// The tally itself is not what latches: every game actually played still
+	// counts, so the report stays an honest record of the match even though
+	// the decision it reports no longer moves.
+	if report.Games != crossedGames+2 {
+		t.Errorf("games = %d, want the straggler's games folded into the tally (%d)", report.Games, crossedGames+2)
+	}
+	if report.Losses != 2 {
+		t.Errorf("losses = %d, want the straggler's losses folded in", report.Losses)
+	}
+}
+
 func TestSPRTBounds(t *testing.T) {
 	s := SPRT{Elo0: 0, Elo1: 5, Alpha: 0.05, Beta: 0.05}
 	lower, upper := s.Bounds()
