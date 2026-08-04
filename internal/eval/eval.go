@@ -23,6 +23,31 @@ type Evaluator interface {
 	Evaluate(p *chess.Position) int
 }
 
+// MoveAware is implemented by evaluators that maintain internal state
+// incrementally as the search walks the tree. Push is called immediately
+// BEFORE p.MakeMove(m) (the pre-move position is what the delta is computed
+// from); Pop after UnmakeMove; PushNull/PopNull around null moves; Reset
+// whenever the search starts from a fresh root position.
+//
+// An evaluator that does not implement this interface — the HCE — is
+// recomputed from scratch on every call, which is correct but is exactly the
+// full-refresh-per-node cost this interface exists to avoid.
+type MoveAware interface {
+	Reset(p *chess.Position)
+	Push(p *chess.Position, m chess.Move)
+	Pop()
+	PushNull()
+	PopNull()
+}
+
+// PerThread is implemented by evaluators that carry per-thread state. The
+// search calls NewThreadEvaluator once per search thread instead of sharing
+// one instance; stateless evaluators (the HCE) don't implement it and stay
+// shared exactly as today.
+type PerThread interface {
+	NewThreadEvaluator() Evaluator
+}
+
 // Score bounds. Mate scores live just below Infinite so that the search can
 // encode "mate in n" as MateScore-n and still compare scores with ordinary
 // integer comparison.
