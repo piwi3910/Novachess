@@ -40,6 +40,10 @@ spec:
                 - "1024"
                 - -lr
                 - "0.001"
+                - -lr-drops
+                - "8,12"
+                - -init
+                - /data/networks/gen0.nnue
               args: ["/data/gen0/"]
               volumeMounts:
                 - name: data

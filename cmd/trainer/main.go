@@ -18,8 +18,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 
+	"github.com/piwi3910/novachess/internal/nnue"
 	"github.com/piwi3910/novachess/internal/train"
 )
 
@@ -27,13 +30,15 @@ func main() {
 	params := train.DefaultParams()
 
 	var (
-		out     = flag.String("out", "network.nnue", "where to write the trained network")
-		epochs  = flag.Int("epochs", params.Epochs, "passes over the data")
-		batch   = flag.Int("batch", params.BatchSize, "samples per weight update")
-		lr      = flag.Float64("lr", params.LearningRate, "learning rate")
-		lambda  = flag.Float64("result-weight", params.ResultWeight, "blend between search score (0) and game result (1)")
-		holdout = flag.Float64("validation", params.ValidationFraction, "fraction of samples held out for validation")
-		seed    = flag.Uint64("seed", params.Seed, "seed for initialization and shuffling")
+		out      = flag.String("out", "network.nnue", "where to write the trained network")
+		epochs   = flag.Int("epochs", params.Epochs, "passes over the data")
+		batch    = flag.Int("batch", params.BatchSize, "samples per weight update")
+		lr       = flag.Float64("lr", params.LearningRate, "learning rate")
+		lrDrops  = flag.String("lr-drops", formatEpochs(params.LRDropEpochs), "comma-separated 1-based epochs at whose start the learning rate halves; empty for a constant rate")
+		lambda   = flag.Float64("result-weight", params.ResultWeight, "blend between search score (0) and game result (1)")
+		holdout  = flag.Float64("validation", params.ValidationFraction, "fraction of samples held out for validation")
+		seed     = flag.Uint64("seed", params.Seed, "seed for initialization and shuffling")
+		initPath = flag.String("init", "", "warm-start from an existing network; if the file does not exist, trains from scratch instead of failing")
 	)
 	flag.Parse()
 
@@ -44,14 +49,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	drops, err := parseEpochs(*lrDrops)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "trainer:", err)
+		os.Exit(1)
+	}
+
 	params.Epochs = *epochs
 	params.BatchSize = *batch
 	params.LearningRate = *lr
+	params.LRDropEpochs = drops
 	params.ResultWeight = *lambda
 	params.ValidationFraction = *holdout
 	params.Seed = *seed
 	params.Progress = func(epoch int, loss float64) {
 		fmt.Fprintf(os.Stderr, "  epoch %2d  loss %.6f\n", epoch, loss)
+	}
+
+	if *initPath != "" {
+		net, err := loadInitNetwork(*initPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "trainer:", err)
+			os.Exit(1)
+		}
+		params.InitNetwork = net
 	}
 
 	trainer, err := train.NewTrainer(params)
@@ -92,6 +113,61 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
+}
+
+// formatEpochs renders a schedule as the comma list -lr-drops expects, so
+// DefaultParams' own schedule can serve as the flag's printed default rather
+// than a value hand-copied out of sync with it.
+func formatEpochs(epochs []int) string {
+	parts := make([]string, len(epochs))
+	for i, e := range epochs {
+		parts[i] = strconv.Itoa(e)
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseEpochs parses -lr-drops's comma list. An empty string is a constant
+// learning rate throughout, not an error.
+func parseEpochs(s string) ([]int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	fields := strings.Split(s, ",")
+	epochs := make([]int, 0, len(fields))
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return nil, fmt.Errorf("-lr-drops %q: %w", s, err)
+		}
+		epochs = append(epochs, n)
+	}
+	return epochs, nil
+}
+
+// loadInitNetwork loads the warm-start network named by -init. A missing
+// file is not an error: the first attempt at a generation has no predecessor
+// to warm-start from, and refusing to train over that would stall the loop
+// for a flag that exists purely to speed up later attempts, so it logs and
+// falls back to training from scratch instead.
+func loadInitNetwork(path string) (*nnue.Network, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "trainer: -init %s does not exist, training from scratch\n", path)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("-init %s: %w", path, err)
+	}
+	e, err := nnue.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("-init %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "trainer: warm-starting from %s\n", path)
+	return e.Network(), nil
 }
 
 // expand turns the given paths into a sorted list of data files.

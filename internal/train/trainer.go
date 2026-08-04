@@ -46,6 +46,33 @@ type Params struct {
 	// Seed fixes the shuffle and the weight initialization.
 	Seed uint64
 
+	// LRDropEpochs lists the 1-based epoch numbers at whose start the
+	// learning rate halves, relative to the rate in effect just before. Must
+	// be strictly ascending and each entry must fall within 1..Epochs. Empty
+	// means a constant rate for the whole run.
+	//
+	// A single fixed rate is a compromise: fast enough early to move off a
+	// random or near-random starting point, but too fast late to settle into
+	// a minimum without overshooting it. Dropping the rate partway through
+	// keeps the early speed and adds the late-run stability without hand-
+	// tuning a schedule per run.
+	LRDropEpochs []int
+
+	// InitNetwork, when set, seeds the model from an existing quantized
+	// network instead of a random initialization - a warm start that resumes
+	// training from a previous generation's result (or a fine-tune target)
+	// rather than from noise.
+	//
+	// This is the exact inverse of (*model).quantize, so it recovers the
+	// float weights to within one quantization step per layer (1/QA for the
+	// feature layer, 1/QB for the output layer) - the same rounding that was
+	// introduced when the network was quantized and written out in the first
+	// place. That is negligible next to what a single epoch of gradient
+	// descent moves a weight; what a warm start buys is starting from the
+	// trained network's basin rather than from random weights, not bit-exact
+	// recovery of the original float model.
+	InitNetwork *nnue.Network
+
 	// Progress, when non-nil, is called after each epoch with the 1-based
 	// epoch number and that epoch's mean training loss — the same value
 	// that ends up in Result.EpochLoss. It exists so a long training run
@@ -64,6 +91,7 @@ func DefaultParams() Params {
 		ScoreScale:         nnue.Scale,
 		ValidationFraction: 0.05,
 		Seed:               1,
+		LRDropEpochs:       []int{8, 12},
 	}
 }
 
@@ -82,7 +110,39 @@ func (p Params) validate() error {
 	case p.ValidationFraction < 0 || p.ValidationFraction >= 1:
 		return fmt.Errorf("train: validation fraction %v is outside 0..1", p.ValidationFraction)
 	}
+	prev := 0
+	for _, d := range p.LRDropEpochs {
+		if d < 1 || d > p.Epochs {
+			return fmt.Errorf("train: lr drop epoch %d is outside 1..%d", d, p.Epochs)
+		}
+		if d <= prev {
+			return fmt.Errorf("train: lr drop epochs must be strictly ascending, got %v", p.LRDropEpochs)
+		}
+		prev = d
+	}
+	if p.InitNetwork != nil {
+		if err := p.InitNetwork.Validate(); err != nil {
+			return fmt.Errorf("train: init network: %w", err)
+		}
+	}
 	return nil
+}
+
+// lrMultiplier returns the learning-rate multiplier in effect at the start of
+// the given 1-based epoch, given ascending drop epochs. The rate halves at
+// each listed epoch and stays halved until the next one, so by epoch e it has
+// halved once for every drop epoch at or before e.
+//
+// Kept as a pure function, independent of Trainer, so the schedule itself can
+// be unit tested without running any training.
+func lrMultiplier(epoch int, drops []int) float64 {
+	m := 1.0
+	for _, d := range drops {
+		if epoch >= d {
+			m *= 0.5
+		}
+	}
+	return m
 }
 
 // Stats reports how a training run went.
@@ -305,8 +365,13 @@ func (t *Trainer) Train(ctx context.Context, samples []Sample) (*nnue.Network, S
 	stats.TrainingSamples = len(trainIdx)
 	stats.ValidationSamples = len(valIdx)
 
-	m := newModel()
-	m.initialize(r)
+	var m *model
+	if t.params.InitNetwork != nil {
+		m = dequantize(t.params.InitNetwork)
+	} else {
+		m = newModel()
+		m.initialize(r)
+	}
 	opt := newAdam(t.params.LearningRate)
 	grad := newModel()
 	work := newWorkspace()
@@ -320,6 +385,12 @@ func (t *Trainer) Train(ctx context.Context, samples []Sample) (*nnue.Network, S
 		}
 
 		shuffle(epochOrder, r)
+
+		// The multiplier is recomputed from the base rate every epoch, rather
+		// than halving opt.lr in place, so that it depends only on the epoch
+		// number and the configured drops - not on accumulated floating point
+		// error from repeated halving.
+		opt.lr = t.params.LearningRate * lrMultiplier(epoch+1, t.params.LRDropEpochs)
 
 		// Losses are summed weighted by batch size rather than averaged over
 		// batches. The last batch of an epoch is usually short, and averaging
@@ -597,6 +668,28 @@ func (m *model) quantize() (*nnue.Network, int) {
 	net.OutputBias = int32(bias)
 
 	return net, clipped
+}
+
+// dequantize seeds a model from an existing quantized network — the exact
+// inverse of (*model).quantize's scale-and-round. It is what makes -init a
+// warm start: the recovered float weights differ from whatever floats
+// produced the network by at most one quantization step per layer (the
+// rounding quantize performed on the way out), which is small next to what a
+// single epoch of training moves a weight and does not matter for a warm
+// start the way it would for, say, verifying training was reproducible.
+func dequantize(net *nnue.Network) *model {
+	m := newModel()
+	for i, v := range net.FeatureWeights {
+		m.featureWeights[i] = float32(float64(v) / nnue.QA)
+	}
+	for i, v := range net.FeatureBias {
+		m.featureBias[i] = float32(float64(v) / nnue.QA)
+	}
+	for i, v := range net.OutputWeights {
+		m.outputWeights[i] = float32(float64(v) / nnue.QB)
+	}
+	m.outputBias = float32(float64(net.OutputBias) / (nnue.QA * nnue.QB))
+	return m
 }
 
 // zero clears a gradient accumulator between batches.
