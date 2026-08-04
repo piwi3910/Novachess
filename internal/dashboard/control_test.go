@@ -88,7 +88,7 @@ func newFakeCluster() *fakeCluster {
 			CronTrainer: {
 				"/usr/local/bin/trainer",
 				"-out", "/data/networks/gen0.nnue",
-				"-epochs", "10",
+				"-epochs", "15",
 				"-batch", "1024",
 				"-lr", "0.001",
 				"-lr-drops", "8,12",
@@ -99,6 +99,7 @@ func newFakeCluster() *fakeCluster {
 				"-candidate", "/data/networks/gen0.nnue",
 				"-games", "2000",
 				"-nodes", "20000",
+				"-concurrency", "6",
 			},
 		},
 		cronArgs: map[string][]string{
@@ -490,7 +491,7 @@ func TestTrainerFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 
 	cmd := fc.jobCommands[0]
-	wantVerbatim := [][2]string{{"-epochs", "10"}, {"-batch", "1024"}, {"-lr", "0.001"}, {"-lr-drops", "8,12"}}
+	wantVerbatim := [][2]string{{"-epochs", "15"}, {"-batch", "1024"}, {"-lr", "0.001"}, {"-lr-drops", "8,12"}}
 	for _, pair := range wantVerbatim {
 		found := false
 		for i, arg := range cmd {
@@ -630,8 +631,10 @@ func TestGen2TrainerDropsInitWhenPredecessorAbsent(t *testing.T) {
 }
 
 // TestGatekeeperFlagsSurviveLaunchVerbatim is the gatekeeper counterpart: its
-// tuned -games/-nodes flags must survive while -candidate is rewritten to
-// the target generation.
+// tuned -games/-nodes/-concurrency flags must survive while -candidate is
+// rewritten to the target generation. -concurrency matters on its own: it is
+// what keeps a gate run from playing one game at a time (see deploy/jobs.yaml),
+// and a launch that silently dropped it would still succeed, just far slower.
 func TestGatekeeperFlagsSurviveLaunchVerbatim(t *testing.T) {
 	ctx := context.Background()
 	fc := newFakeCluster()
@@ -645,7 +648,7 @@ func TestGatekeeperFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 
 	cmd := fc.jobCommands[0]
-	wantVerbatim := [][2]string{{"-games", "2000"}, {"-nodes", "20000"}}
+	wantVerbatim := [][2]string{{"-games", "2000"}, {"-nodes", "20000"}, {"-concurrency", "6"}}
 	for _, pair := range wantVerbatim {
 		found := false
 		for i, arg := range cmd {
