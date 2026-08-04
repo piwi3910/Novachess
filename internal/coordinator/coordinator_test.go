@@ -41,11 +41,24 @@ func testConfig() Config {
 func putBatch(t *testing.T, s store.Store, unitID string, generation, positions int) events.GameBatch {
 	t.Helper()
 
+	batch, err := putBatchErr(s, unitID, generation, positions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return batch
+}
+
+// putBatchErr is putBatch's error-returning twin, for use from goroutines
+// other than the test's own: t.Fatal/t.FailNow must only ever be called on
+// the goroutine running the test function, so code running on a spawned
+// goroutine reports failure by returning an error instead and lets the test
+// goroutine call t.Fatal after joining.
+func putBatchErr(s store.Store, unitID string, generation, positions int) (events.GameBatch, error) {
 	artifact, err := s.Put(context.Background(),
 		fmt.Sprintf("gen%d/%s.novadata", generation, unitID),
 		strings.NewReader(strings.Repeat("x", 64)+unitID))
 	if err != nil {
-		t.Fatal(err)
+		return events.GameBatch{}, err
 	}
 
 	return events.GameBatch{
@@ -57,7 +70,42 @@ func putBatch(t *testing.T, s store.Store, unitID string, generation, positions 
 		Checksum:    artifact.Checksum,
 		Positions:   positions,
 		Games:       5,
-	}
+	}, nil
+}
+
+// publishBatches runs on its own goroutine, publishing synthetic batches
+// until the generation reaches its target or the context is cancelled. It
+// never calls anything on *testing.T: t.Fatal/t.FailNow are only safe on the
+// goroutine that runs the test function, so any error is instead sent back
+// on the returned channel for the test goroutine to report after joining via
+// the returned WaitGroup.
+func publishBatches(ctx context.Context, wg *sync.WaitGroup, b bus.Bus, s store.Store, c *Coordinator, idFor func(i int) string, generation, positions, target int) <-chan error {
+	errc := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(errc)
+		for i := 0; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			batch, err := putBatchErr(s, idFor(i), generation, positions)
+			if err != nil {
+				errc <- err
+				return
+			}
+			if err := b.Publish(context.Background(), events.SubjectGamesProduced, batch); err != nil {
+				return
+			}
+			if c.Progress().Positions >= target {
+				return
+			}
+		}
+	}()
+	return errc
 }
 
 // putValidArtifact writes a real .novadata artifact with n samples, the way
@@ -124,24 +172,26 @@ func TestCoordinatorIssuesWorkAndAssemblesADataset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Feed batches in from another goroutine, as workers would.
-	go func() {
-		for i := 0; ; i++ {
-			batch := putBatch(t, s, fmt.Sprintf("g0-u%06d", i), 0, 100)
-			if err := b.Publish(context.Background(), events.SubjectGamesProduced, batch); err != nil {
-				return
-			}
-			if c.Progress().Positions >= testConfig().PositionsPerGeneration {
-				return
-			}
-		}
-	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Feed batches in from another goroutine, as workers would. The
+	// WaitGroup is joined below, and the error channel drained, before this
+	// test can return — a goroutine that outlived the test previously called
+	// t.Fatal after completion and panicked the whole binary.
+	var wg sync.WaitGroup
+	errc := publishBatches(ctx, &wg, b, s, c, func(i int) string {
+		return fmt.Sprintf("g0-u%06d", i)
+	}, 0, 100, testConfig().PositionsPerGeneration)
+
 	progress, err := c.RunGeneration(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	wg.Wait()
+	if err := <-errc; err != nil {
 		t.Fatal(err)
 	}
 
@@ -605,25 +655,27 @@ func TestCoordinatorResumesFromExistingArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Feed batches in from another goroutine, as workers would, using IDs that
-	// cannot collide with the pre-existing ones.
-	go func() {
-		for i := 100; ; i++ {
-			batch := putBatch(t, s, fmt.Sprintf("g%d-live%06d", cfg.Generation, i), cfg.Generation, 50)
-			if err := b.Publish(context.Background(), events.SubjectGamesProduced, batch); err != nil {
-				return
-			}
-			if c.Progress().Positions >= cfg.PositionsPerGeneration {
-				return
-			}
-		}
-	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Feed batches in from another goroutine, as workers would, using IDs
+	// that cannot collide with the pre-existing ones. The WaitGroup is
+	// joined below, and the error channel drained, before this test can
+	// return — a goroutine that outlived the test previously called t.Fatal
+	// after completion and panicked the whole binary.
+	var wg sync.WaitGroup
+	errc := publishBatches(ctx, &wg, b, s, c, func(i int) string {
+		return fmt.Sprintf("g%d-live%06d", cfg.Generation, i+100)
+	}, cfg.Generation, 50, cfg.PositionsPerGeneration)
+
 	progress, err := c.RunGeneration(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	wg.Wait()
+	if err := <-errc; err != nil {
 		t.Fatal(err)
 	}
 
