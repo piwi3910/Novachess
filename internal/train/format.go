@@ -394,3 +394,31 @@ func (r *Reader) ReadAll() ([]Sample, error) {
 		out = append(out, s)
 	}
 }
+
+// Count consumes the rest of the stream and reports how many fixed-size
+// records it holds, without decoding a single one.
+//
+// This proves framing integrity, not per-sample validity: it confirms the
+// header already checked out in NewReader and that the bytes after it are a
+// whole number of RecordSize records, the same thing a truncated write from
+// an evicted worker would violate. It does not run DecodeSample, so it says
+// nothing about whether an individual record's occupancy, piece codes or
+// result byte are sane — a file with intact framing but corrupt sample bytes
+// passes Count and is only caught later, when the trainer actually reads the
+// sample. That is the right trade for a startup scan whose only job is
+// deciding whether a unit's artifact already exists: proving the file is not
+// a half-write is ~600x cheaper than decoding every position in it, and full
+// validity is still enforced, just later, by the reader that actually needs
+// the data.
+func (r *Reader) Count() (int, error) {
+	n, err := io.Copy(io.Discard, r.r)
+	if err != nil {
+		return 0, err
+	}
+	if n%RecordSize != 0 {
+		return int(n / RecordSize), fmt.Errorf(
+			"train: truncated record: %d trailing bytes after %d whole records",
+			n%RecordSize, n/RecordSize)
+	}
+	return int(n / RecordSize), nil
+}

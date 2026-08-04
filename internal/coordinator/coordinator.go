@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/piwi3910/novachess/internal/bus"
@@ -366,6 +367,23 @@ func (c *Coordinator) topUp(ctx context.Context) error {
 	return nil
 }
 
+// resumeScanConcurrency bounds how many artifacts resume checks at once.
+// Latency to the artifact store, not CPU, dominates this scan — on an
+// NFS-backed volume a single request can take longer than decoding ever
+// would — so overlapping requests helps more than it would for local disk,
+// and 8 is enough to hide that latency without hammering the store.
+const resumeScanConcurrency = 8
+
+// resumeScanLogInterval is how often, in files scanned, resume logs progress
+// while it runs, in addition to the time-based tick below. Both exist
+// because a corpus small enough to never hit the file count still deserves a
+// heartbeat if it is slow, and a corpus that blows past the count deserves
+// one before the timer would next fire.
+const resumeScanLogInterval = 500
+
+// resumeScanLogPeriod is the time-based half of the same heartbeat.
+const resumeScanLogPeriod = 15 * time.Second
+
 // resume scans the generation's artifact directory for units an earlier run
 // already produced, so a restart resumes a generation rather than replaying
 // it — reissuing every unit from zero costs hours of byte-identical self-play
@@ -377,16 +395,67 @@ func (c *Coordinator) topUp(ctx context.Context) error {
 // truncated artifact left by a worker evicted mid-write is indistinguishable
 // from one that was never written, and trusting it would silently drop its
 // positions out of the dataset forever.
+//
+// Checking an artifact costs one round trip to the store plus a framing check
+// (see countPositions and train.Reader.Count) rather than a full decode, and
+// artifacts are checked concurrently, bounded by resumeScanConcurrency: on a
+// large generation read from a networked volume, a serial full-decode scan
+// has been observed to run for many minutes with the whole cluster idle,
+// because every worker is waiting on the coordinator to resume issuing work.
+// Results are applied to coordinator state in the store's listing order
+// (store.Store.List guarantees a sorted listing), not completion order, so
+// the resumed c.artifacts — and the ArtifactURIs announce() puts on the bus
+// — are deterministic regardless of which goroutine finishes first.
 func (c *Coordinator) resume(ctx context.Context) error {
 	uris, err := c.store.List(ctx, fmt.Sprintf("gen%d", c.generation))
 	if err != nil {
 		return fmt.Errorf("coordinator: scanning for existing artifacts: %w", err)
 	}
 
-	var positions, count int
-	for _, uri := range uris {
+	c.log.Info("scanning existing artifacts before issuing work",
+		"generation", c.generation, "candidates", len(uris))
+
+	type scanResult struct {
+		index int
+		uri   string
+		n     int
+		valid bool
+	}
+	results := make([]scanResult, len(uris))
+
+	start := time.Now()
+	var scanned int64
+
+	stopHeartbeat := make(chan struct{})
+	var heartbeatWG sync.WaitGroup
+	heartbeatWG.Add(1)
+	go func() {
+		defer heartbeatWG.Done()
+		ticker := time.NewTicker(resumeScanLogPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.log.Info("still scanning existing artifacts",
+					"generation", c.generation,
+					"done", atomic.LoadInt64(&scanned),
+					"total", len(uris),
+					"elapsed", time.Since(start).Round(time.Second))
+			case <-stopHeartbeat:
+				return
+			}
+		}
+	}()
+
+	sem := make(chan struct{}, resumeScanConcurrency)
+	var wg sync.WaitGroup
+	var scanErr error
+	var scanErrOnce sync.Once
+
+	for i, uri := range uris {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			scanErrOnce.Do(func() { scanErr = ctx.Err() })
+			break
 		}
 
 		index, ok := c.unitIndex(uri)
@@ -394,27 +463,67 @@ func (c *Coordinator) resume(ctx context.Context) error {
 			continue
 		}
 
-		n, err := c.countPositions(ctx, uri)
-		if err != nil {
-			c.log.Warn("discarding an existing artifact that does not validate",
-				"error", err, "artifact", uri)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			scanErrOnce.Do(func() { scanErr = ctx.Err() })
+		}
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(i int, uri string, index int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			n, err := c.countPositions(ctx, uri)
+			if err != nil {
+				c.log.Warn("discarding an existing artifact that does not validate",
+					"error", err, "artifact", uri)
+			} else {
+				results[i] = scanResult{index: index, uri: uri, n: n, valid: true}
+			}
+
+			done := atomic.AddInt64(&scanned, 1)
+			if done%resumeScanLogInterval == 0 {
+				c.log.Info("still scanning existing artifacts",
+					"generation", c.generation,
+					"done", done,
+					"total", len(uris),
+					"elapsed", time.Since(start).Round(time.Second))
+			}
+		}(i, uri, index)
+	}
+
+	wg.Wait()
+	close(stopHeartbeat)
+	heartbeatWG.Wait()
+
+	if scanErr != nil {
+		return scanErr
+	}
+
+	var positions, count int
+	for _, r := range results {
+		if !r.valid {
 			continue
 		}
 
-		unitID := c.unit(index).ID
+		unitID := c.unit(r.index).ID
 
 		c.mu.Lock()
 		if !c.resolved[unitID] {
 			c.resolved[unitID] = true
-			c.covered[index] = true
-			c.artifacts = append(c.artifacts, uri)
-			c.positions += n
+			c.covered[r.index] = true
+			c.artifacts = append(c.artifacts, r.uri)
+			c.positions += r.n
 			// issued is bumped in step with resolved so this unit contributes
 			// nothing to topUp's outstanding count: it was never issued this
 			// run, and none of the queue's capacity should be spent waiting on
 			// it.
 			c.issued++
-			positions += n
+			positions += r.n
 			count++
 		}
 		c.mu.Unlock()
@@ -456,11 +565,15 @@ func (c *Coordinator) unitIndex(uri string) (int, bool) {
 	return index, true
 }
 
-// countPositions reads an artifact end to end and returns how many samples it
-// holds, proving along the way that it decodes cleanly. A truncated or
-// otherwise corrupt file surfaces as an error here rather than a plausible
-// count, so resume treats it as absent instead of trusting a number that
-// was never really there.
+// countPositions checks an artifact's framing and returns how many samples it
+// holds, without decoding any of them (train.Reader.Count — see its doc for
+// exactly what that does and does not prove). A truncated or otherwise
+// malformed file surfaces as an error here rather than a plausible count, so
+// resume treats it as absent instead of trusting a number that was never
+// really there. A file whose framing is intact but whose sample bytes are
+// individually corrupt is not caught here — that is caught later, when the
+// trainer actually decodes the sample, which is the correct place to pay for
+// that check on a startup path that must not stall the cluster.
 func (c *Coordinator) countPositions(ctx context.Context, uri string) (int, error) {
 	rc, err := c.store.Get(ctx, uri)
 	if err != nil {
@@ -472,11 +585,7 @@ func (c *Coordinator) countPositions(ctx context.Context, uri string) (int, erro
 	if err != nil {
 		return 0, err
 	}
-	samples, err := reader.ReadAll()
-	if err != nil {
-		return 0, err
-	}
-	return len(samples), nil
+	return reader.Count()
 }
 
 // unit builds the nth work unit of this generation.

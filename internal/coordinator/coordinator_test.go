@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -868,5 +869,79 @@ func TestCoordinatorIgnoresLiveBatchesForResumedUnits(t *testing.T) {
 	if after.Positions != before.Positions || after.Batches != before.Batches {
 		t.Errorf("a live batch for a resumed unit was counted again: %d positions/%d batches became %d/%d",
 			before.Positions, before.Batches, after.Positions, after.Batches)
+	}
+}
+
+// TestCoordinatorResumeScanIsConcurrentAndDeterministic covers the point of
+// this change: resume must scan a large artifact set concurrently, count
+// every one of them correctly, and still land on the exact same resumed
+// totals and the same (sorted) artifact list every time, regardless of which
+// goroutine in the worker pool happens to finish first. A resume that raced
+// its own bookkeeping would show up here as a flaky total or a shuffled
+// ArtifactURIs list, not as a crash.
+func TestCoordinatorResumeScanIsConcurrentAndDeterministic(t *testing.T) {
+	const numArtifacts = 200
+	const perUnit = 3
+
+	b := bus.NewMemory("test")
+	s := testStore(t)
+	cfg := testConfig()
+
+	ids, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantURIs := make([]string, numArtifacts)
+	for i := 0; i < numArtifacts; i++ {
+		wantURIs[i] = putValidArtifact(t, s, cfg.Generation, ids.unit(i).ID, perUnit)
+	}
+	sort.Strings(wantURIs)
+
+	// A couple of files that do not match this generation's unit naming, to
+	// confirm the concurrent scan still leaves them alone.
+	if _, err := s.Put(context.Background(),
+		fmt.Sprintf("gen%d/not-a-unit.txt", cfg.Generation),
+		strings.NewReader("not a training artifact")); err != nil {
+		t.Fatal(err)
+	}
+
+	runResume := func() (int, int, []string) {
+		t.Helper()
+		c, err := New(cfg, b, s, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := c.resume(ctx); err != nil {
+			t.Fatal(err)
+		}
+		progress := c.Progress()
+		// Deliberately not re-sorted here: resume must already hand back a
+		// deterministic, sorted list on its own, independent of which
+		// goroutine in the scan's worker pool happened to finish first.
+		artifacts := append([]string(nil), c.artifacts...)
+		return progress.Positions, progress.Batches, artifacts
+	}
+
+	wantPositions := numArtifacts * perUnit
+
+	for run := 0; run < 3; run++ {
+		positions, batches, artifacts := runResume()
+		if positions != wantPositions {
+			t.Errorf("run %d: resumed %d positions, want %d", run, positions, wantPositions)
+		}
+		if batches != numArtifacts {
+			t.Errorf("run %d: resumed %d artifacts, want %d", run, batches, numArtifacts)
+		}
+		if len(artifacts) != len(wantURIs) {
+			t.Fatalf("run %d: resumed %d artifact URIs, want %d", run, len(artifacts), len(wantURIs))
+		}
+		for i := range artifacts {
+			if artifacts[i] != wantURIs[i] {
+				t.Errorf("run %d: artifact %d is %q, want %q", run, i, artifacts[i], wantURIs[i])
+			}
+		}
 	}
 }
