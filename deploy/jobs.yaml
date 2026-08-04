@@ -94,12 +94,18 @@ spec:
                 - "2000"
                 - -nodes
                 - "20000"
+                - -concurrency
+                - "6"
               volumeMounts:
                 - name: data
                   mountPath: /data
               resources:
                 requests:
-                  cpu: "4"
+                  # Self-play is parked while a gate runs, so these six
+                  # concurrent pairs (each still one thread per side) have the
+                  # board close to themselves rather than sharing it - raised
+                  # from 4 now that a gate no longer plays one game at a time.
+                  cpu: "6"
                   memory: 1Gi
                 limits:
                   memory: 2Gi

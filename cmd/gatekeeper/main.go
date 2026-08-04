@@ -50,6 +50,7 @@ func main() {
 		hash          = flag.Int("hash", match.HashMB, "transposition table megabytes per side")
 		randomPlies   = flag.Int("random-plies", match.RandomPlies, "random moves played from each opening")
 		seed          = flag.Uint64("seed", match.Seed, "seed for opening selection")
+		concurrency   = flag.Int("concurrency", match.Concurrency, "colour-reversed pairs played at once; each pair is still one thread per side")
 	)
 	flag.Parse()
 
@@ -62,6 +63,7 @@ func main() {
 	sprt.Elo0, sprt.Elo1, sprt.Alpha, sprt.Beta = *elo0, *elo1, *alpha, *beta
 	match.MaxGames, match.NodesPerMove, match.HashMB = *games, *nodes, *hash
 	match.RandomPlies, match.Seed = *randomPlies, *seed
+	match.Concurrency = *concurrency
 
 	candidate, err := nnue.Load(*candidatePath)
 	if err != nil {
