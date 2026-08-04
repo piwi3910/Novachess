@@ -5,6 +5,44 @@ import (
 	"github.com/piwi3910/novachess/internal/eval"
 )
 
+// make plays m on st.pos, driving st.moveAware's Push first if the evaluator
+// keeps incremental state. Push must run on the PRE-move position, which is
+// why it comes before MakeMove rather than after: every raw make/unmake call
+// site in this package goes through make/unmake precisely so this ordering
+// cannot be gotten wrong at a second call site later.
+func (st *state) make(m chess.Move) {
+	if st.moveAware != nil {
+		st.moveAware.Push(st.pos, m)
+	}
+	st.pos.MakeMove(m)
+}
+
+// unmake undoes the move made by the matching make, then pops the
+// evaluator's accumulator back to the position one ply up.
+func (st *state) unmake() {
+	st.pos.UnmakeMove()
+	if st.moveAware != nil {
+		st.moveAware.Pop()
+	}
+}
+
+// makeNull and unmakeNull are make/unmake's counterparts for the null-move
+// pruning pair: no board feature changes, only the side to move, so the
+// evaluator gets PushNull/PopNull instead of a delta.
+func (st *state) makeNull() {
+	if st.moveAware != nil {
+		st.moveAware.PushNull()
+	}
+	st.pos.MakeNullMove()
+}
+
+func (st *state) unmakeNull() {
+	st.pos.UnmakeNullMove()
+	if st.moveAware != nil {
+		st.moveAware.PopNull()
+	}
+}
+
 // negamax searches a node and returns its score from the side to move's
 // perspective.
 //
@@ -37,7 +75,7 @@ func (st *state) negamax(alpha, beta, depth, ply int, allowNull bool) int {
 			return eval.DrawScore
 		}
 		if ply >= MaxPly-1 {
-			return st.s.evaluator.Evaluate(st.pos)
+			return st.ev.Evaluate(st.pos)
 		}
 
 		// Mate distance pruning. If a mate has already been found closer to the
@@ -66,7 +104,7 @@ func (st *state) negamax(alpha, beta, depth, ply int, allowNull bool) int {
 	// still.
 	staticEval := 0
 	if !inCheck {
-		staticEval = st.s.evaluator.Evaluate(st.pos)
+		staticEval = st.ev.Evaluate(st.pos)
 	}
 
 	if !isPV && !inCheck && !isRoot {
@@ -85,9 +123,9 @@ func (st *state) negamax(alpha, beta, depth, ply int, allowNull bool) int {
 		// king and pawns — which is where zugzwang actually occurs.
 		if allowNull && depth >= 3 && staticEval >= beta && st.hasNonPawnMaterial() {
 			reduction := 3 + depth/6
-			st.pos.MakeNullMove()
+			st.makeNull()
 			score := -st.negamax(-beta, -beta+1, depth-reduction, ply+1, false)
-			st.pos.UnmakeNullMove()
+			st.unmakeNull()
 
 			if st.aborted {
 				return 0
@@ -121,7 +159,7 @@ func (st *state) negamax(alpha, beta, depth, ply int, allowNull bool) int {
 		m := pickMove(&ml, scores, i)
 		isQuiet := !st.pos.IsCapture(m) && m.Kind() != chess.KindPromotion
 
-		st.pos.MakeMove(m)
+		st.make(m)
 
 		var score int
 		switch {
@@ -159,7 +197,7 @@ func (st *state) negamax(alpha, beta, depth, ply int, allowNull bool) int {
 			}
 		}
 
-		st.pos.UnmakeMove()
+		st.unmake()
 		searched++
 
 		if st.aborted {
@@ -214,7 +252,7 @@ func (st *state) quiescence(alpha, beta, ply int) int {
 		st.selDepth = ply
 	}
 	if ply >= MaxPly-1 {
-		return st.s.evaluator.Evaluate(st.pos)
+		return st.ev.Evaluate(st.pos)
 	}
 	if st.pos.IsRepetition() || st.pos.IsFiftyMoveRule() || st.pos.IsDeadPosition() {
 		return eval.DrawScore
@@ -226,7 +264,7 @@ func (st *state) quiescence(alpha, beta, ply int) int {
 	if !inCheck {
 		// Standing pat: the side to move is not obliged to capture, so the
 		// static evaluation is a lower bound on what it can achieve.
-		bestScore = st.s.evaluator.Evaluate(st.pos)
+		bestScore = st.ev.Evaluate(st.pos)
 		if bestScore >= beta {
 			return bestScore
 		}
@@ -259,9 +297,9 @@ func (st *state) quiescence(alpha, beta, ply int) int {
 			}
 		}
 
-		st.pos.MakeMove(m)
+		st.make(m)
 		score := -st.quiescence(-beta, -alpha, ply+1)
-		st.pos.UnmakeMove()
+		st.unmake()
 
 		if st.aborted {
 			return 0

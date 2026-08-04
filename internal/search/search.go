@@ -168,6 +168,19 @@ type state struct {
 	s   *Searcher
 	pos *chess.Position
 
+	// ev is this thread's evaluator. It is the shared evaluator when the
+	// configured one carries no state (the HCE), or a private instance from
+	// eval.PerThread's NewThreadEvaluator when it does (NNUE): the whole
+	// reason a state exists per thread rather than being shared is that only
+	// one thread at a time may drive an incremental evaluator's accumulator
+	// stack.
+	ev eval.Evaluator
+	// moveAware is ev again, asserted once at construction, or nil when ev
+	// carries no state to keep in step. make/unmake/makeNull/unmakeNull are
+	// the only places that touch it, so a call site cannot forget to pair a
+	// Push with its Pop: there is no other way to advance st.pos.
+	moveAware eval.MoveAware
+
 	nodes    uint64
 	selDepth int
 
@@ -232,6 +245,23 @@ func (s *Searcher) Search(ctx context.Context, pos *chess.Position, limits Limit
 			ctx:      ctx,
 			maxNodes: limits.Nodes,
 			threadID: id,
+		}
+		if pt, ok := s.evaluator.(eval.PerThread); ok {
+			// A stateful evaluator (NNUE) gets its own accumulator stack per
+			// thread; sharing one would mean every lazy SMP thread writing
+			// the same accumulator at once.
+			st.ev = pt.NewThreadEvaluator()
+		} else {
+			// Stateless (the HCE): sharing is exactly as safe as it always
+			// was, so every thread reads the one evaluator on the searcher.
+			st.ev = s.evaluator
+		}
+		if ma, ok := st.ev.(eval.MoveAware); ok {
+			st.moveAware = ma
+			// Prime the accumulator for this thread's root before any
+			// Push/Pop walks the tree, so nothing from a previous search on
+			// this evaluator can leak in.
+			ma.Reset(st.pos)
 		}
 		if hard > 0 {
 			st.deadline = start.Add(hard)

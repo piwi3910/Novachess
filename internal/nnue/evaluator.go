@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/piwi3910/novachess/internal/chess"
+	"github.com/piwi3910/novachess/internal/eval"
 )
 
 // Evaluator adapts a network to the interface the search evaluates through, so
@@ -61,4 +62,14 @@ func (e *Evaluator) Evaluate(p *chess.Position) int {
 	var acc Accumulator
 	acc.Refresh(e.net, p)
 	return e.net.Evaluate(&acc, p.SideToMove())
+}
+
+// NewThreadEvaluator returns an incremental evaluator over the same network,
+// private to one search thread. This is what lets the search upgrade from a
+// full refresh per node to an accumulator maintained by delta, without the
+// search needing to know anything about NNUE beyond eval.MoveAware: it
+// satisfies eval.PerThread so that every existing construction site
+// (New, Load) transparently gains the faster per-thread path.
+func (e *Evaluator) NewThreadEvaluator() eval.Evaluator {
+	return NewIncremental(e.net)
 }
