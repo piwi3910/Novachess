@@ -287,3 +287,48 @@ func TestMultiThreadedSelfPlayWouldNotBeReproducible(t *testing.T) {
 	t.Logf("four threaded runs visited %v nodes (identical: %v) — self-play uses one thread for exactly this reason",
 		nodeCounts, identical)
 }
+
+// TestMultiThreadedSearchWithIncrementalEvaluator checks that lazy SMP stays
+// correct when each thread's evaluator is the incremental NNUE one rather
+// than the shared, stateless HCE.
+//
+// Every other SMP test in this file uses eval.NewHCE(), which has no mutable
+// state to race on — sharing it across threads was always safe. The NNUE
+// incremental evaluator is the first stateful per-thread object this search
+// has ever driven concurrently, and newState's whole reason for existing (a
+// private accumulator stack per thread, via eval.PerThread) is untested by
+// every other SMP case here. Like the rest of this file, this cannot compare
+// results across runs — SMP is non-deterministic by design — so it only
+// asserts the invariants that must hold regardless: the search completes and
+// returns a legal move.
+func TestMultiThreadedSearchWithIncrementalEvaluator(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("needs more than one CPU to exercise threading")
+	}
+
+	net := testNetworkForSearch(t)
+	fen := "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+
+	p := mustParse(t, fen)
+	s := New(nnueIncremental(t, net), 16)
+	s.SetThreads(4)
+
+	res := s.Search(context.Background(), p, Limits{Depth: 6}, nil)
+
+	if res.Best.IsNone() {
+		t.Fatal("no move returned")
+	}
+
+	var legal chess.MoveList
+	p.GenerateLegalMoves(&legal)
+	found := false
+	for _, m := range legal.Slice() {
+		if m == res.Best {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("%s is not legal in %s", res.Best, fen)
+	}
+}

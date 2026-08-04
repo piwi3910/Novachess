@@ -73,6 +73,28 @@ func New(s SPRT, m MatchConfig) (*Gate, error) {
 // The test is applied after each colour-reversed pair rather than after each
 // game. Checking mid-pair would let a match stop on the half of a pair where
 // the candidate had White, turning an opening's imbalance into a verdict.
+//
+// Pairs are played g.match.Concurrency at a time, and results are folded into
+// the running tally - and tested against the SPRT bounds - in the order they
+// arrive, which need not be index order. That means the number of games a run
+// stops after is no longer fixed by the seed alone: at Concurrency > 1 it can
+// vary from one run to the next, because which pair happens to be the one
+// that pushes the LLR across a bound depends on how the goroutines were
+// scheduled. This does not weaken the test itself - the SPRT's error
+// guarantees rest on each game being an independent sample of the same
+// distribution, which is exactly what a pair played by its own pair of
+// single-threaded searchers, from an opening that is a pure function of its
+// index, still is. Only the stopping point moves; the promotion decision it
+// protects does not become less reliable for arriving sooner.
+//
+// The verdict itself latches once reached (see fold): up to Concurrency-1
+// other pairs can still be in flight at that instant, and their results are
+// delivered afterwards while runPairs is cancelling and draining them. A
+// verdict recomputed on every arrival would let one of those stragglers pull
+// the LLR back inside the band and turn a legitimately crossed verdict into
+// Inconclusive - which is exactly backwards: the SPRT's stopping rule is a
+// decision made at the moment of crossing, not a running summary that keeps
+// being revised.
 func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (Report, error) {
 	var report Report
 	report.Lower, report.Upper = g.sprt.Bounds()
@@ -99,41 +121,46 @@ func (g *Gate) Test(ctx context.Context, candidate, incumbent eval.Evaluator) (R
 		return report, err
 	}
 
-	for pair := 0; pair < pairs; pair++ {
-		if err := ctx.Err(); err != nil {
-			return finish(err)
-		}
+	// runPairs plays pairs from the same match config the plain runner would,
+	// so a gated match and an ungated one play identically pair for pair; the
+	// only difference here is stopping once the SPRT concludes, which cancels
+	// whatever pairs are still in flight and drains their results before this
+	// function returns.
+	err := runPairs(ctx, candidate, incumbent, g.match, pairs, func(r pairResult) bool {
+		return fold(&report, g.sprt, r)
+	})
 
-		// One pair at a time, reusing the match runner so that a gated match
-		// and a plain one play identically.
-		cfg := g.match
-		cfg.MaxGames = 2
-		cfg.Seed = g.match.Seed + uint64(pair)*0x9E3779B97F4A7C15
-		cfg.Openings = g.match.Openings
-		if len(cfg.Openings) > 0 {
-			cfg.Openings = []string{g.match.Openings[pair%len(g.match.Openings)]}
-		}
+	return finish(err)
+}
 
-		result, err := RunMatch(ctx, candidate, incumbent, cfg)
-		if err != nil {
-			return finish(err)
-		}
+// fold merges one pair's result into report and, if the verdict is not yet
+// decided, tests it against the SPRT bounds.
+//
+// Wins, Losses, Draws, Games and Nodes always fold in every pair delivered,
+// including stragglers that arrive after a verdict - the report's tally
+// stays an honest count of every game actually played, whether or not it
+// still moves the decision. Verdict and LLR are different: once Verdict is
+// no longer Inconclusive it latches, and neither field is touched again. That
+// is what makes the stopping decision stick at the pair that actually crossed
+// a bound, rather than at whichever pair happened to be folded in last.
+//
+// fold reports whether the match is decided, so the caller can keep using its
+// return value as runPairs' stop signal after the latch as before.
+func fold(report *Report, sprt SPRT, r pairResult) bool {
+	report.Wins += r.wins
+	report.Losses += r.losses
+	report.Draws += r.draws
+	report.Games += r.wins + r.losses + r.draws
+	report.Nodes += r.nodes
 
-		report.Wins += result.Wins
-		report.Losses += result.Losses
-		report.Draws += result.Draws
-		report.Games += result.Games
-		report.Nodes += result.Nodes
-
-		verdict, llr := g.sprt.Test(report.Wins, report.Losses, report.Draws)
-		report.Verdict, report.LLR = verdict, llr
-
-		if verdict != Inconclusive {
-			break
-		}
+	if report.Verdict != Inconclusive {
+		return true
 	}
 
-	return finish(nil)
+	verdict, llr := sprt.Test(report.Wins, report.Losses, report.Draws)
+	report.Verdict, report.LLR = verdict, llr
+
+	return verdict != Inconclusive
 }
 
 // explain puts the decision into a sentence, including the numbers that would

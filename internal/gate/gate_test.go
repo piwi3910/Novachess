@@ -3,9 +3,11 @@ package gate
 import (
 	"context"
 	"math"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/piwi3910/novachess/internal/chess"
 	"github.com/piwi3910/novachess/internal/eval"
@@ -222,6 +224,56 @@ func TestInconclusiveIsNotAPromotion(t *testing.T) {
 	r := Report{Verdict: Inconclusive, Wins: 100, Losses: 0, Draws: 0}
 	if r.Promoted() {
 		t.Error("an inconclusive match counted as a promotion")
+	}
+}
+
+// TestVerdictLatchesAfterCrossing drives fold directly, rather than through a
+// live match, so the arrival order that matters - a crossing followed by
+// contrary stragglers - is exact rather than left to goroutine scheduling.
+// Without the latch in fold, the straggler losses folded in after the
+// crossing would pull the LLR back inside the band and flip Verdict back to
+// Inconclusive; runPairs can deliver exactly this shape, since up to
+// Concurrency-1 pairs may still be in flight - and still report their result -
+// at the instant one of them crosses a bound.
+func TestVerdictLatchesAfterCrossing(t *testing.T) {
+	s := SPRT{Elo0: 0, Elo1: 200, Alpha: 0.05, Beta: 0.05}
+	var report Report
+	report.Lower, report.Upper = s.Bounds()
+
+	// Fold decisive wins until the upper bound is crossed.
+	var crossed bool
+	for i := 0; i < 50 && !crossed; i++ {
+		crossed = fold(&report, s, pairResult{wins: 2})
+	}
+	if !crossed || report.Verdict != Accept {
+		t.Fatalf("setup did not cross the upper bound: verdict %v llr %v", report.Verdict, report.LLR)
+	}
+	crossedLLR := report.LLR
+	crossedGames := report.Games
+
+	// A straggler pair that is a pure loss for the candidate, arriving after
+	// the crossing - exactly what an in-flight pair can deliver once runPairs
+	// has already reported the crossing pair upstream.
+	stop := fold(&report, s, pairResult{losses: 2})
+
+	if !stop {
+		t.Error("fold did not keep reporting the match as decided once the verdict had latched")
+	}
+	if report.Verdict != Accept {
+		t.Errorf("verdict flipped to %v after a contrary straggler; a crossed verdict must stick", report.Verdict)
+	}
+	if report.LLR != crossedLLR {
+		t.Errorf("LLR moved from %v to %v after the latch; it must stay at the value it crossed on", crossedLLR, report.LLR)
+	}
+
+	// The tally itself is not what latches: every game actually played still
+	// counts, so the report stays an honest record of the match even though
+	// the decision it reports no longer moves.
+	if report.Games != crossedGames+2 {
+		t.Errorf("games = %d, want the straggler's games folded into the tally (%d)", report.Games, crossedGames+2)
+	}
+	if report.Losses != 2 {
+		t.Errorf("losses = %d, want the straggler's losses folded in", report.Losses)
 	}
 }
 
@@ -464,6 +516,13 @@ func TestInterruptedGateStillReports(t *testing.T) {
 	// how well anything plays, and it pays for a calibration run as well.
 	cfg.NodesPerMove = 120
 	cfg.MaxPlies = 40
+	// This test's calibration only lands where it expects at one pair at a
+	// time: with several pairs running at once the shared evaluation counter
+	// would trip while multiple pairs are each partway through, rather than
+	// after a whole number of them have completed. Concurrency's effect on the
+	// stopping point is covered separately, by
+	// TestConcurrentEarlyStopCancelsPromptly.
+	cfg.Concurrency = 1
 
 	g, err := New(DefaultSPRT(), cfg)
 	if err != nil {
@@ -615,5 +674,123 @@ func TestOpeningsVaryBetweenPairs(t *testing.T) {
 	}
 	if len(seen) < 6 {
 		t.Errorf("8 pairs produced only %d distinct openings", len(seen))
+	}
+}
+
+// collectPairResults runs every pair of a match to completion - never stopping
+// early - and returns each pair's result indexed by its pair number, so a test
+// can compare one run against another pair by pair rather than only on their
+// summed totals.
+func collectPairResults(t *testing.T, cfg MatchConfig) []pairResult {
+	t.Helper()
+
+	pairs := cfg.MaxGames / 2
+	results := make([]pairResult, pairs)
+	seen := make([]bool, pairs)
+
+	err := runPairs(context.Background(), eval.NewHCE(), blindEval{}, cfg, pairs, func(r pairResult) bool {
+		results[r.index] = r
+		seen[r.index] = true
+		return false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, ok := range seen {
+		if !ok {
+			t.Fatalf("pair %d never reported a result", i)
+		}
+	}
+	return results
+}
+
+// TestConcurrencyDoesNotChangeWhichGamesArePlayed is the load-bearing test for
+// this package's concurrency: it checks that running the same match at
+// Concurrency 1 and Concurrency 4 plays the identical game at every pair
+// index, not merely the same totals in aggregate. A bug that let pairs share
+// state - a transposition table or searcher reused across goroutines, an
+// opening derived from anything but the pair's own index - would tend to
+// leave the summed totals looking plausible while individual pairs quietly
+// differed; comparing index by index catches that.
+func TestConcurrencyDoesNotChangeWhichGamesArePlayed(t *testing.T) {
+	cfg := testMatchConfig()
+	cfg.MaxGames = 40 // 20 pairs, enough to give concurrency room to reorder.
+
+	cfg.Concurrency = 1
+	sequential := collectPairResults(t, cfg)
+
+	cfg.Concurrency = 4
+	concurrent := collectPairResults(t, cfg)
+
+	if len(sequential) != len(concurrent) {
+		t.Fatalf("%d pairs sequentially, %d concurrently", len(sequential), len(concurrent))
+	}
+	for i := range sequential {
+		if sequential[i] != concurrent[i] {
+			t.Errorf("pair %d: sequential %+v, concurrent %+v", i, sequential[i], concurrent[i])
+		}
+	}
+}
+
+// TestConcurrentEarlyStopCancelsPromptly checks that once the SPRT reaches a
+// verdict, the gate does not wait for pairs still in flight to run to their
+// own completion, and that the goroutines playing them have actually
+// unwound - not merely stopped reporting - by the time Test returns. A gate
+// that leaked a handful of goroutines per generation would be easy to miss in
+// any one run and would still add up over a long-lived training loop.
+func TestConcurrentEarlyStopCancelsPromptly(t *testing.T) {
+	cfg := testMatchConfig()
+	// Far more games than the match will need: if cancellation did not work,
+	// the test would run long enough for the timeout below to catch it rather
+	// than quietly passing on a fast machine.
+	cfg.MaxGames = 100000
+	cfg.Concurrency = 4
+
+	// A wide band, so the match concludes in a handful of pairs and leaves
+	// most of MaxGames unplayed for cancellation to actually matter.
+	s := SPRT{Elo0: 0, Elo1: 200, Alpha: 0.05, Beta: 0.05}
+	g, err := New(s, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := runtime.NumGoroutine()
+
+	done := make(chan Report, 1)
+	go func() {
+		report, err := g.Test(context.Background(), eval.NewHCE(), blindEval{})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- report
+	}()
+
+	var report Report
+	select {
+	case report = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Test did not return promptly after a decisive verdict; in-flight pairs may not be getting cancelled")
+	}
+
+	if !report.Promoted() {
+		t.Fatalf("candidate was not promoted: %s", report.Reason)
+	}
+	if report.Games >= cfg.MaxGames {
+		t.Errorf("used all %d games despite a decisive verdict; the match limit should not have been reached", cfg.MaxGames)
+	}
+
+	// The workers still in flight when the verdict landed must have actually
+	// returned by now, not merely stopped sending results - otherwise a gate
+	// run after run would slowly leak goroutines.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if after := runtime.NumGoroutine(); after <= before+2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("goroutine count did not settle back down after Test returned: was %d, still %d", before, runtime.NumGoroutine())
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

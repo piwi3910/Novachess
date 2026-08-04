@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -458,6 +460,51 @@ func TestDeleteRemoves(t *testing.T) {
 	}
 }
 
+// TestListReturnsArtifactsUnderAPrefix is what a coordinator resuming a
+// generation relies on: discovering what is already on disk without knowing
+// any names in advance.
+func TestListReturnsArtifactsUnderAPrefix(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	var want []string
+	for i := 0; i < 3; i++ {
+		artifact, err := s.Put(ctx, fmt.Sprintf("gen1/g1-u%06d.novadata", i), strings.NewReader("data"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, artifact.URI)
+	}
+	// A different generation's artifact must not show up in gen1's listing.
+	if _, err := s.Put(ctx, "gen2/g2-u000000.novadata", strings.NewReader("data")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.List(ctx, "gen1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("List(gen1) = %v, want %v", got, want)
+	}
+}
+
+// TestListOfAMissingPrefixIsEmpty checks that a generation which has not
+// produced anything yet looks exactly like one that never started: no error,
+// no results.
+func TestListOfAMissingPrefixIsEmpty(t *testing.T) {
+	s := newTestStore(t)
+
+	got, err := s.List(context.Background(), "gen9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("List of a never-written prefix returned %v, want none", got)
+	}
+}
+
 func TestValidateKey(t *testing.T) {
 	valid := []string{
 		"a",
@@ -643,6 +690,9 @@ func (c *cancellingStore) Stat(context.Context, string) (Artifact, error) {
 	return Artifact{}, errors.New("not used")
 }
 func (c *cancellingStore) Delete(context.Context, string) error { return errors.New("not used") }
+func (c *cancellingStore) List(context.Context, string) ([]string, error) {
+	return nil, errors.New("not used")
+}
 
 // cancellingReader never ends. If Verify ignored its context this would hang
 // rather than fail, which is the honest way to represent "reads a very large

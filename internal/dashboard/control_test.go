@@ -88,15 +88,18 @@ func newFakeCluster() *fakeCluster {
 			CronTrainer: {
 				"/usr/local/bin/trainer",
 				"-out", "/data/networks/gen0.nnue",
-				"-epochs", "10",
+				"-epochs", "15",
 				"-batch", "1024",
 				"-lr", "0.001",
+				"-lr-drops", "8,12",
+				"-init", "/data/networks/gen0.nnue",
 			},
 			CronGatekeeper: {
 				"/usr/local/bin/gatekeeper",
 				"-candidate", "/data/networks/gen0.nnue",
 				"-games", "2000",
 				"-nodes", "20000",
+				"-concurrency", "6",
 			},
 		},
 		cronArgs: map[string][]string{
@@ -488,7 +491,7 @@ func TestTrainerFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 
 	cmd := fc.jobCommands[0]
-	wantVerbatim := [][2]string{{"-epochs", "10"}, {"-batch", "1024"}, {"-lr", "0.001"}}
+	wantVerbatim := [][2]string{{"-epochs", "15"}, {"-batch", "1024"}, {"-lr", "0.001"}, {"-lr-drops", "8,12"}}
 	for _, pair := range wantVerbatim {
 		found := false
 		for i, arg := range cmd {
@@ -523,9 +526,115 @@ func TestTrainerFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 }
 
+// initFlagValue returns the element following -init in cmd, or "" with found
+// set to false if -init is not present at all.
+func initFlagValue(cmd []string) (value string, found bool) {
+	for i, arg := range cmd {
+		if arg == "-init" {
+			if i+1 >= len(cmd) {
+				return "", true
+			}
+			return cmd[i+1], true
+		}
+	}
+	return "", false
+}
+
+// TestGen0TrainerKeepsInitWhenFileExists checks that generation 0's -init
+// flag survives launch pointed at gen0.nnue - a warm start from an earlier
+// attempt at generation 0 itself - when that file is actually present on the
+// data volume.
+func TestGen0TrainerKeepsInitWhenFileExists(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	writeNetworkFile(t, dataDir, 0)
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartTrainer(ctx, 0, true); err != nil {
+		t.Fatalf("StartTrainer: %v", err)
+	}
+
+	value, found := initFlagValue(fc.jobCommands[0])
+	if !found {
+		t.Fatalf("expected -init to survive when gen0.nnue exists, got %v", fc.jobCommands[0])
+	}
+	if value != "/data/networks/gen0.nnue" {
+		t.Fatalf("expected -init to point at gen0.nnue, got %q", value)
+	}
+}
+
+// TestGen0TrainerDropsInitWhenFileAbsent is the converse: with no gen0.nnue
+// on the data volume - a generation 0's very first training attempt - -init
+// must be dropped entirely rather than launched pointing at a file that was
+// never written.
+func TestGen0TrainerDropsInitWhenFileAbsent(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartTrainer(ctx, 0, true); err != nil {
+		t.Fatalf("StartTrainer: %v", err)
+	}
+
+	if _, found := initFlagValue(fc.jobCommands[0]); found {
+		t.Fatalf("expected -init to be dropped when gen0.nnue is absent, got %v", fc.jobCommands[0])
+	}
+}
+
+// TestGen2TrainerRewritesInitToPredecessor checks the fine-tune case: a
+// generation 2 training launch with generation 1's promoted network present
+// rewrites -init to point at gen1.nnue rather than leaving the template's
+// baked-in gen0.nnue.
+func TestGen2TrainerRewritesInitToPredecessor(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	writeNetworkFile(t, dataDir, 1)
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartTrainer(ctx, 2, true); err != nil {
+		t.Fatalf("StartTrainer: %v", err)
+	}
+
+	value, found := initFlagValue(fc.jobCommands[0])
+	if !found {
+		t.Fatalf("expected -init to survive when gen1.nnue exists, got %v", fc.jobCommands[0])
+	}
+	if value != "/data/networks/gen1.nnue" {
+		t.Fatalf("expected -init rewritten to gen1.nnue, got %q", value)
+	}
+}
+
+// TestGen2TrainerDropsInitWhenPredecessorAbsent checks that the generation-2
+// fine-tune case still drops -init entirely when generation 1's network is
+// not on the volume, rather than launching pointed at a file that does not
+// exist.
+func TestGen2TrainerDropsInitWhenPredecessorAbsent(t *testing.T) {
+	ctx := context.Background()
+	fc := newFakeCluster()
+	dataDir := t.TempDir()
+	h := NewHistory(filepath.Join(dataDir, "history.jsonl"))
+	ct := NewController(fc, h, dataDir, 4)
+
+	if _, err := ct.StartTrainer(ctx, 2, true); err != nil {
+		t.Fatalf("StartTrainer: %v", err)
+	}
+
+	if _, found := initFlagValue(fc.jobCommands[0]); found {
+		t.Fatalf("expected -init to be dropped when gen1.nnue is absent, got %v", fc.jobCommands[0])
+	}
+}
+
 // TestGatekeeperFlagsSurviveLaunchVerbatim is the gatekeeper counterpart: its
-// tuned -games/-nodes flags must survive while -candidate is rewritten to
-// the target generation.
+// tuned -games/-nodes/-concurrency flags must survive while -candidate is
+// rewritten to the target generation. -concurrency matters on its own: it is
+// what keeps a gate run from playing one game at a time (see deploy/jobs.yaml),
+// and a launch that silently dropped it would still succeed, just far slower.
 func TestGatekeeperFlagsSurviveLaunchVerbatim(t *testing.T) {
 	ctx := context.Background()
 	fc := newFakeCluster()
@@ -539,7 +648,7 @@ func TestGatekeeperFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 
 	cmd := fc.jobCommands[0]
-	wantVerbatim := [][2]string{{"-games", "2000"}, {"-nodes", "20000"}}
+	wantVerbatim := [][2]string{{"-games", "2000"}, {"-nodes", "20000"}, {"-concurrency", "6"}}
 	for _, pair := range wantVerbatim {
 		found := false
 		for i, arg := range cmd {

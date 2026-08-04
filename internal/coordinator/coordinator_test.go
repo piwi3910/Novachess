@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -9,8 +10,10 @@ import (
 	"time"
 
 	"github.com/piwi3910/novachess/internal/bus"
+	"github.com/piwi3910/novachess/internal/chess"
 	"github.com/piwi3910/novachess/internal/events"
 	"github.com/piwi3910/novachess/internal/store"
+	"github.com/piwi3910/novachess/internal/train"
 )
 
 func testStore(t *testing.T) *store.FS {
@@ -38,11 +41,24 @@ func testConfig() Config {
 func putBatch(t *testing.T, s store.Store, unitID string, generation, positions int) events.GameBatch {
 	t.Helper()
 
+	batch, err := putBatchErr(s, unitID, generation, positions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return batch
+}
+
+// putBatchErr is putBatch's error-returning twin, for use from goroutines
+// other than the test's own: t.Fatal/t.FailNow must only ever be called on
+// the goroutine running the test function, so code running on a spawned
+// goroutine reports failure by returning an error instead and lets the test
+// goroutine call t.Fatal after joining.
+func putBatchErr(s store.Store, unitID string, generation, positions int) (events.GameBatch, error) {
 	artifact, err := s.Put(context.Background(),
 		fmt.Sprintf("gen%d/%s.novadata", generation, unitID),
 		strings.NewReader(strings.Repeat("x", 64)+unitID))
 	if err != nil {
-		t.Fatal(err)
+		return events.GameBatch{}, err
 	}
 
 	return events.GameBatch{
@@ -54,7 +70,70 @@ func putBatch(t *testing.T, s store.Store, unitID string, generation, positions 
 		Checksum:    artifact.Checksum,
 		Positions:   positions,
 		Games:       5,
+	}, nil
+}
+
+// publishBatches runs on its own goroutine, publishing synthetic batches
+// until the generation reaches its target or the context is cancelled. It
+// never calls anything on *testing.T: t.Fatal/t.FailNow are only safe on the
+// goroutine that runs the test function, so any error is instead sent back
+// on the returned channel for the test goroutine to report after joining via
+// the returned WaitGroup.
+func publishBatches(ctx context.Context, wg *sync.WaitGroup, b bus.Bus, s store.Store, c *Coordinator, idFor func(i int) string, generation, positions, target int) <-chan error {
+	errc := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(errc)
+		for i := 0; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			batch, err := putBatchErr(s, idFor(i), generation, positions)
+			if err != nil {
+				errc <- err
+				return
+			}
+			if err := b.Publish(context.Background(), events.SubjectGamesProduced, batch); err != nil {
+				return
+			}
+			if c.Progress().Positions >= target {
+				return
+			}
+		}
+	}()
+	return errc
+}
+
+// putValidArtifact writes a real .novadata artifact with n samples, the way
+// a worker's own write actually looks on disk. putBatch's fixture data is not
+// train-format — it exists only to exercise store.Verify's checksum — and
+// resume needs something train.NewReader will genuinely decode.
+func putValidArtifact(t *testing.T, s store.Store, generation int, unitID string, n int) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w, err := train.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	pos := chess.NewPosition()
+	for i := 0; i < n; i++ {
+		if err := w.Write(train.Sample{Position: pos, Score: 10, Result: train.Drawn, Ply: uint16(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	key := fmt.Sprintf("gen%d/%s%s", generation, unitID, train.FileExtension)
+	artifact, err := s.Put(context.Background(), key, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return artifact.URI
 }
 
 func collect(t *testing.T, b bus.Bus, subject string) func() []events.Envelope {
@@ -93,24 +172,26 @@ func TestCoordinatorIssuesWorkAndAssemblesADataset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Feed batches in from another goroutine, as workers would.
-	go func() {
-		for i := 0; ; i++ {
-			batch := putBatch(t, s, fmt.Sprintf("g0-u%06d", i), 0, 100)
-			if err := b.Publish(context.Background(), events.SubjectGamesProduced, batch); err != nil {
-				return
-			}
-			if c.Progress().Positions >= testConfig().PositionsPerGeneration {
-				return
-			}
-		}
-	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Feed batches in from another goroutine, as workers would. The
+	// WaitGroup is joined below, and the error channel drained, before this
+	// test can return — a goroutine that outlived the test previously called
+	// t.Fatal after completion and panicked the whole binary.
+	var wg sync.WaitGroup
+	errc := publishBatches(ctx, &wg, b, s, c, func(i int) string {
+		return fmt.Sprintf("g0-u%06d", i)
+	}, 0, 100, testConfig().PositionsPerGeneration)
+
 	progress, err := c.RunGeneration(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	wg.Wait()
+	if err := <-errc; err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,5 +618,255 @@ func TestGenerationDoesNotStallOnEmptyUnits(t *testing.T) {
 	if got := len(units()); got <= issuedFirst {
 		t.Errorf("after %d empty units the coordinator issued no more work (%d units total)",
 			cfg.UnitsInFlight+2, got)
+	}
+}
+
+// TestCoordinatorResumesFromExistingArtifacts is the replay tax this task
+// exists to remove: a restart must not reissue work whose artifact is
+// already on disk. Units 0..2 are pre-populated as a previous run would have
+// left them; a fresh coordinator must count their positions without ever
+// putting their IDs back on the bus.
+func TestCoordinatorResumesFromExistingArtifacts(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+	cfg := testConfig()
+
+	// A throwaway coordinator only to compute the canonical IDs a fresh run
+	// would assign to indices 0..2 — the same derivation resume must match.
+	ids, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const preUnits = 3
+	const perUnit = 60
+	preIDs := make(map[string]bool, preUnits)
+	for i := 0; i < preUnits; i++ {
+		id := ids.unit(i).ID
+		preIDs[id] = true
+		putValidArtifact(t, s, cfg.Generation, id, perUnit)
+	}
+
+	units := collect(t, b, events.SubjectWorkAssign)
+	datasets := collect(t, b, events.SubjectDatasetReady)
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Feed batches in from another goroutine, as workers would, using IDs
+	// that cannot collide with the pre-existing ones. The WaitGroup is
+	// joined below, and the error channel drained, before this test can
+	// return — a goroutine that outlived the test previously called t.Fatal
+	// after completion and panicked the whole binary.
+	var wg sync.WaitGroup
+	errc := publishBatches(ctx, &wg, b, s, c, func(i int) string {
+		return fmt.Sprintf("g%d-live%06d", cfg.Generation, i+100)
+	}, cfg.Generation, 50, cfg.PositionsPerGeneration)
+
+	progress, err := c.RunGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	wg.Wait()
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+
+	if !progress.Complete {
+		t.Error("the resumed generation did not complete")
+	}
+	if progress.Positions < cfg.PositionsPerGeneration {
+		t.Errorf("finished with %d positions, the target was %d", progress.Positions, cfg.PositionsPerGeneration)
+	}
+	if progress.Positions < preUnits*perUnit {
+		t.Errorf("the resumed total of %d positions does not include the %d pre-existing ones",
+			progress.Positions, preUnits*perUnit)
+	}
+
+	for _, env := range units() {
+		var u events.WorkUnit
+		if err := bus.Unmarshal(env, &u); err != nil {
+			t.Fatal(err)
+		}
+		if preIDs[u.ID] {
+			t.Errorf("unit %s was reissued despite its artifact already being on disk", u.ID)
+		}
+	}
+
+	announced := datasets()
+	if len(announced) != 1 {
+		t.Fatalf("%d datasets announced, want 1", len(announced))
+	}
+	var ready events.DatasetReady
+	if err := bus.Unmarshal(announced[0], &ready); err != nil {
+		t.Fatal(err)
+	}
+	if ready.Positions != progress.Positions {
+		t.Errorf("the dataset claims %d positions, the generation counted %d", ready.Positions, progress.Positions)
+	}
+}
+
+// TestCoordinatorReissuesATruncatedArtifact is the safety valve on resume: a
+// file that cannot be read back in full must not be trusted, because a
+// truncated artifact left by an evicted worker looks, at a glance, exactly
+// like a real one.
+func TestCoordinatorReissuesATruncatedArtifact(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+	cfg := testConfig()
+
+	ids, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitID := ids.unit(0).ID
+
+	var buf bytes.Buffer
+	w, err := train.NewWriter(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(train.Sample{Position: chess.NewPosition(), Score: 1, Result: train.Drawn}); err != nil {
+		t.Fatal(err)
+	}
+	truncated := buf.Bytes()[:buf.Len()-5] // cut off mid-record
+
+	key := fmt.Sprintf("gen%d/%s%s", cfg.Generation, unitID, train.FileExtension)
+	if _, err := s.Put(context.Background(), key, bytes.NewReader(truncated)); err != nil {
+		t.Fatal(err)
+	}
+
+	units := collect(t, b, events.SubjectWorkAssign)
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Progress(); got.Positions != 0 || got.Batches != 0 {
+		t.Errorf("a truncated artifact counted %d positions across %d batches, want 0 across 0",
+			got.Positions, got.Batches)
+	}
+
+	if err := c.topUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, env := range units() {
+		var u events.WorkUnit
+		if err := bus.Unmarshal(env, &u); err != nil {
+			t.Fatal(err)
+		}
+		if u.ID == unitID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the truncated unit %s was not reissued", unitID)
+	}
+}
+
+// TestCoordinatorAnnouncesWithoutIssuingWhenAlreadyMet covers the case where
+// a restart finds a generation that had, in fact, already finished: the
+// dataset announces immediately and nothing new goes out.
+func TestCoordinatorAnnouncesWithoutIssuingWhenAlreadyMet(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+	cfg := testConfig()
+
+	ids, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	perUnit := cfg.PositionsPerGeneration / 3
+	for i := 0; i < 3; i++ {
+		putValidArtifact(t, s, cfg.Generation, ids.unit(i).ID, perUnit)
+	}
+
+	units := collect(t, b, events.SubjectWorkAssign)
+	datasets := collect(t, b, events.SubjectDatasetReady)
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	progress, err := c.RunGeneration(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !progress.Complete {
+		t.Error("a generation already met by existing artifacts did not complete")
+	}
+	if progress.Positions < cfg.PositionsPerGeneration {
+		t.Errorf("finished with %d positions, the target was %d", progress.Positions, cfg.PositionsPerGeneration)
+	}
+	if got := len(units()); got != 0 {
+		t.Errorf("%d units were issued when existing artifacts already met the target", got)
+	}
+
+	announced := datasets()
+	if len(announced) != 1 {
+		t.Fatalf("%d datasets announced, want 1", len(announced))
+	}
+}
+
+// TestCoordinatorIgnoresLiveBatchesForResumedUnits keeps the at-least-once
+// dedup honest across a restart: a redelivered batch for a unit resume
+// already counted from disk must be ignored exactly like any other
+// duplicate, not counted a second time.
+func TestCoordinatorIgnoresLiveBatchesForResumedUnits(t *testing.T) {
+	b := bus.NewMemory("test")
+	s := testStore(t)
+	cfg := testConfig()
+
+	ids, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitID := ids.unit(0).ID
+	putValidArtifact(t, s, cfg.Generation, unitID, 100)
+
+	c, err := New(cfg, b, s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.resume(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	before := c.Progress()
+
+	// A redelivery of the same unit, as at-least-once delivery guarantees can
+	// produce for a message sent before the restart.
+	batch := putBatch(t, s, unitID, cfg.Generation, 100)
+	env, err := bus.NewEnvelope(events.SubjectGamesProduced, "test", batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.handleBatch(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+
+	after := c.Progress()
+	if after.Positions != before.Positions || after.Batches != before.Batches {
+		t.Errorf("a live batch for a resumed unit was counted again: %d positions/%d batches became %d/%d",
+			before.Positions, before.Batches, after.Positions, after.Batches)
 	}
 }

@@ -38,6 +38,40 @@ func generationPathRewriter(generation int) func(string) string {
 	}
 }
 
+// dropFlagPair wraps base with a flag/value pair that is either passed
+// through (with the value optionally rewritten to replacement, when
+// non-empty) or dropped entirely - flag and its value both - depending on
+// include. This is the shared mechanism behind both -incumbent (gatekeeper)
+// and -init (trainer): each names a predecessor network that may not exist
+// yet, and the flag has to disappear from the launched Job rather than point
+// at a file that was never written.
+func dropFlagPair(base func(string) string, flag string, include bool, replacement string) func(string) string {
+	var prev string
+	removeNext := false
+	return func(elem string) string {
+		if removeNext {
+			removeNext = false
+			prev = elem
+			return ""
+		}
+		if elem == flag {
+			prev = elem
+			if !include {
+				removeNext = true
+				return ""
+			}
+			return elem
+		}
+
+		out := base(elem)
+		if prev == flag && include && replacement != "" {
+			out = replacement
+		}
+		prev = elem
+		return out
+	}
+}
+
 // gatekeeperRewriter extends generationPathRewriter with the -incumbent
 // flag's generation-aware handling: pointed at generation-1 when it should
 // be present, removed entirely when it should not (generation 0, or no
@@ -50,39 +84,44 @@ func generationPathRewriter(generation int) func(string) string {
 // The insertion point is the candidate path because it is guaranteed to
 // appear exactly once, immediately after -candidate, in every gatekeeper
 // invocation; if a future template ever bakes an explicit -incumbent flag in
-// as well, this would append a second one; nothing in the current template
-// does.
+// as well, dropFlagPair handles rewriting or dropping it and this would
+// append a second one - nothing in the current template does.
 func gatekeeperRewriter(generation int, includeIncumbent bool) func(string) string {
 	base := generationPathRewriter(generation)
 	incumbentPath := fmt.Sprintf("/data/networks/gen%d.nnue", generation-1)
+	rewrite := dropFlagPair(base, "-incumbent", includeIncumbent, incumbentPath)
 
 	var prev string
-	removeNext := false
 	return func(elem string) string {
-		if removeNext {
-			removeNext = false
-			prev = elem
-			return ""
-		}
-		if elem == "-incumbent" {
-			prev = elem
-			if !includeIncumbent {
-				removeNext = true
-				return ""
-			}
-			return elem
-		}
-
-		out := base(elem)
-		switch {
-		case prev == "-incumbent" && includeIncumbent:
-			out = incumbentPath
-		case prev == "-candidate" && includeIncumbent:
+		out := rewrite(elem)
+		if prev == "-candidate" && includeIncumbent {
 			out = out + " -incumbent " + incumbentPath
 		}
 		prev = elem
 		return out
 	}
+}
+
+// trainerRewriter extends generationPathRewriter with the -init flag's
+// generation-aware handling: for generation 0 the value after -init is left
+// as the template's baked-in gen0.nnue (a warm start from an earlier attempt
+// at generation 0 itself - there is no earlier generation to fine-tune from
+// yet); for generation G>0 it is rewritten to /data/networks/gen<G-1>.nnue,
+// the promoted predecessor. In both cases, if the target file is not present
+// on the volume, the whole -init pair is dropped via dropFlagPair - the same
+// mechanism gatekeeperRewriter uses for -incumbent - rather than launching a
+// job pointed at a file that was never written.
+//
+// Unlike -incumbent, -init is always baked into the trainer CronJob template
+// (deploy/jobs.yaml), so there is no insertion case: the flag and its value
+// are always present in the input stream, only conditionally kept.
+func trainerRewriter(generation int, includeInit bool) func(string) string {
+	base := generationPathRewriter(generation)
+	replacement := ""
+	if generation > 0 {
+		replacement = fmt.Sprintf("/data/networks/gen%d.nnue", generation-1)
+	}
+	return dropFlagPair(base, "-init", includeInit, replacement)
 }
 
 // RefusedError marks a guardrail refusal - a request the controller
@@ -170,6 +209,13 @@ func (ct *Controller) StartSelfplay(ctx context.Context, force bool) error {
 // self-play data the coordinator is currently producing, so it refuses to
 // start while the coordinator is running unless force is set - otherwise the
 // dataset it trains on could be mutated mid-run.
+//
+// -init warm-starts training from a predecessor network: generation 0 from
+// an earlier attempt at generation 0 itself, later generations from the
+// previous generation's promoted network. Whichever file that is, it may not
+// exist yet - a generation's very first training attempt has no predecessor
+// - so the flag is included only when the file is actually present on the
+// data volume, exactly as StartGatekeeper already does for -incumbent.
 func (ct *Controller) StartTrainer(ctx context.Context, generation int, force bool) (string, error) {
 	if !force {
 		replicas, err := ct.cluster.Replicas(ctx, DeployCoordinator)
@@ -180,8 +226,19 @@ func (ct *Controller) StartTrainer(ctx context.Context, generation int, force bo
 			return "", &RefusedError{Reason: fmt.Sprintf("dashboard: coordinator is still running for generation %d; pass force to train anyway", generation)}
 		}
 	}
+
+	initGeneration := generation
+	if generation > 0 {
+		initGeneration = generation - 1
+	}
+	includeInit := false
+	initPath := filepath.Join(ct.dataDir, "networks", fmt.Sprintf("gen%d.nnue", initGeneration))
+	if _, err := os.Stat(initPath); err == nil {
+		includeInit = true
+	}
+
 	jobName := fmt.Sprintf("train-gen%d-%d", generation, time.Now().Unix())
-	if err := ct.cluster.CreateJobFromCron(ctx, CronTrainer, jobName, generationPathRewriter(generation)); err != nil {
+	if err := ct.cluster.CreateJobFromCron(ctx, CronTrainer, jobName, trainerRewriter(generation, includeInit)); err != nil {
 		return "", err
 	}
 	return jobName, nil

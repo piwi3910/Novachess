@@ -18,6 +18,9 @@ func testParams() Params {
 	p.BatchSize = 32
 	p.ValidationFraction = 0.2
 	p.Seed = 0xC0FFEE
+	// DefaultParams' drop epochs (8, 12) fall outside this short test run's 3
+	// epochs; tests that care about the schedule set their own.
+	p.LRDropEpochs = nil
 	return p
 }
 
@@ -391,6 +394,76 @@ func TestQuantizationPreservesTheModel(t *testing.T) {
 		100*stats.QuantizationError/stats.EvaluationScale, stats.ClippedWeights)
 }
 
+// TestWarmStartRoundTripsThroughQuantization is Task 5's round-trip test for
+// -init: train a tiny network, quantize and write it out (the same path
+// cmd/trainer's -out takes), read it back in and dequantize it (the same
+// path -init takes), and check the recovered float model evaluates close to
+// the network that was written.
+//
+// "Close" rather than "identical" is the point: quantize rounds every weight
+// to an integer, so dequantize's float recovery cannot be bit-exact. The
+// tolerance below is one quantization step per layer converted to
+// centipawns - QA and QB scale the feature and output layers respectively,
+// and HiddenSize terms of the feature layer's rounding can all land the same
+// way in the worst case, so the bound is generous rather than tight. What
+// this test guards against is a scale mixed up between layers or a sign
+// error in the inverse, either of which would blow far past this bound; it
+// is not a claim that dequantization is lossless.
+func TestWarmStartRoundTripsThroughQuantization(t *testing.T) {
+	p := testParams()
+	p.Epochs = 5
+	p.LearningRate = 0.01
+
+	tr, err := NewTrainer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	net, _, err := tr.Train(context.Background(), materialCorpus(t, 256))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Round-trip through the on-disk format, exactly as -out writes and -init
+	// reads.
+	var buf bytes.Buffer
+	if _, err := net.WriteTo(&buf); err != nil {
+		t.Fatalf("write network: %v", err)
+	}
+	loaded, err := nnue.ReadFrom(&buf)
+	if err != nil {
+		t.Fatalf("read network back: %v", err)
+	}
+
+	warm := dequantize(loaded)
+
+	// One quantization step in the underlying units, converted to the
+	// centipawn scale the forward pass produces (Scale converts the model's
+	// raw output, so the same conversion applies to the tolerance).
+	featureStep := 1.0 / nnue.QA
+	outputStep := 1.0 / nnue.QB
+	tolerance := (featureStep + outputStep) * nnue.Scale
+
+	data, err := tr.prepare(materialCorpus(t, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := newWorkspace()
+
+	var acc nnue.Accumulator
+	for _, e := range data.examples {
+		warmCP := float64(forward(warm, data, e, w)) * nnue.Scale
+
+		acc = nnue.Accumulator{}
+		nnue.RefreshFromFeatures(&acc, loaded, data.whiteFeatures(e), data.blackFeatures(e))
+		loadedCP := float64(loaded.Evaluate(&acc, e.stm))
+
+		if diff := math.Abs(warmCP - loadedCP); diff > tolerance {
+			t.Errorf("warm-started evaluation %v cp differs from loaded network's %v cp by %v, want within %v",
+				warmCP, loadedCP, diff, tolerance)
+		}
+	}
+}
+
 // TestValidationSetIsHeldOut checks that held-out positions really are excluded
 // from training. A validation split that leaked would report a loss that says
 // nothing about generalization, which is the only thing it exists to say.
@@ -527,6 +600,35 @@ func TestProgressReportsEveryEpoch(t *testing.T) {
 	}
 }
 
+// TestLRMultiplierSchedule pins down the pure epoch-to-multiplier mapping
+// without running any training: the rate is unchanged before the first drop,
+// halves at each listed epoch, stays halved between drops, and compounds
+// across multiple drops.
+func TestLRMultiplierSchedule(t *testing.T) {
+	drops := []int{8, 12}
+	cases := []struct {
+		epoch int
+		want  float64
+	}{
+		{1, 1},
+		{7, 1},
+		{8, 0.5},
+		{9, 0.5},
+		{11, 0.5},
+		{12, 0.25},
+		{20, 0.25},
+	}
+	for _, tc := range cases {
+		if got := lrMultiplier(tc.epoch, drops); got != tc.want {
+			t.Errorf("lrMultiplier(%d, %v) = %v, want %v", tc.epoch, drops, got, tc.want)
+		}
+	}
+
+	if got := lrMultiplier(5, nil); got != 1 {
+		t.Errorf("lrMultiplier with no drops = %v, want 1", got)
+	}
+}
+
 func TestTrainRejectsBadParams(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -539,6 +641,10 @@ func TestTrainRejectsBadParams(t *testing.T) {
 		{"negative result weight", func(p *Params) { p.ResultWeight = -0.1 }},
 		{"no score scale", func(p *Params) { p.ScoreScale = 0 }},
 		{"all data held out", func(p *Params) { p.ValidationFraction = 1 }},
+		{"lr drop epoch below 1", func(p *Params) { p.LRDropEpochs = []int{0} }},
+		{"lr drop epoch past Epochs", func(p *Params) { p.LRDropEpochs = []int{p.Epochs + 1} }},
+		{"lr drop epochs not ascending", func(p *Params) { p.LRDropEpochs = []int{2, 2} }},
+		{"lr drop epochs descending", func(p *Params) { p.LRDropEpochs = []int{2, 1} }},
 	}
 
 	for _, tc := range cases {
