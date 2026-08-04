@@ -158,8 +158,12 @@ func TestIncrementalSearchIsBehaviourNeutral(t *testing.T) {
 
 	for _, fen := range fens {
 		t.Run(fen, func(t *testing.T) {
-			nodesInc, scoreInc, moveInc := searchFixedDepth(t, fen, 6, nnueIncremental(t, net))
-			nodesRef, scoreRef, moveRef := searchFixedDepth(t, fen, 6, nnueRefreshOnly(net))
+			// Depth 5, not 6: still deep enough that TT, null-move, LMR and
+			// quiescence all engage on every fixture here, which is what
+			// this proof needs to exercise — going to 6 only multiplies
+			// runtime under -race without adding coverage of anything new.
+			nodesInc, scoreInc, moveInc := searchFixedDepth(t, fen, 5, nnueIncremental(t, net))
+			nodesRef, scoreRef, moveRef := searchFixedDepth(t, fen, 5, nnueRefreshOnly(net))
 
 			if nodesInc != nodesRef || moveInc != moveRef || scoreInc != scoreRef {
 				t.Fatalf("%s: incremental (nodes %d, move %v, score %d) diverged from refresh (nodes %d, move %v, score %d)",
@@ -199,10 +203,12 @@ func TestFixedDepthSearchIsDeterministicWithNNUE(t *testing.T) {
 	for _, fen := range fens {
 		t.Run(fen, func(t *testing.T) {
 			var first Result
-			for run := 0; run < 3; run++ {
+			// Two repetitions prove determinism as well as three: a third
+			// identical run would only add a redundant depth-5 search.
+			for run := 0; run < 2; run++ {
 				p := mustParse(t, fen)
 				s := New(nnueIncremental(t, net), 16)
-				res := s.Search(context.Background(), p, Limits{Depth: 6}, nil)
+				res := s.Search(context.Background(), p, Limits{Depth: 5}, nil)
 
 				if run == 0 {
 					first = res

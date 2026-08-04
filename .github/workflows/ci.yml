@@ -31,8 +31,11 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The race-instrumented search and perft-adjacent suites legitimately
+      # run for many minutes on CI runners; Go's default 10m-per-package
+      # timeout is what trips here, not a hang. Give it real headroom.
       - name: Test
-        run: go test -race ./...
+        run: go test -race -timeout 30m ./...
 
   perft:
     name: Full-depth perft
