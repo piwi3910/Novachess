@@ -77,11 +77,30 @@ func (e *refreshOnlyEvaluator) Evaluate(p *chess.Position) int {
 // nnueIncremental wraps the same network in the production nnue.Evaluator,
 // which now implements eval.PerThread and so drives the search onto the
 // incremental accumulator path exercised by this proof.
-func nnueIncremental(net *nnue.Network) eval.Evaluator {
+//
+// It hard-asserts the interfaces the whole proof depends on. Without this,
+// the test can silently stop testing anything: if nnue.Evaluator ever lost
+// PerThread, or the search's type assertion in newState drifted so it never
+// picked the per-thread evaluator up, st.ev would fall back to the shared
+// stateless evaluator on BOTH sides of the comparison. The test would then
+// compare a refresh-only search against another refresh-only search, pass
+// trivially, and keep passing even on a fully reverted diff.
+func nnueIncremental(t *testing.T, net *nnue.Network) eval.Evaluator {
+	t.Helper()
 	e, err := nnue.NewEvaluator(net)
 	if err != nil {
-		panic(err)
+		t.Fatalf("nnue.NewEvaluator: %v", err)
 	}
+
+	pt, ok := eval.Evaluator(e).(eval.PerThread)
+	if !ok {
+		t.Fatalf("*nnue.Evaluator no longer implements eval.PerThread; the incremental path is unreachable and this test can no longer distinguish it from refresh-only")
+	}
+	thread := pt.NewThreadEvaluator()
+	if _, ok := thread.(eval.MoveAware); !ok {
+		t.Fatalf("NewThreadEvaluator()'s result no longer implements eval.MoveAware; the search would silently treat it as a stateless evaluator")
+	}
+
 	return e
 }
 
@@ -127,7 +146,7 @@ func TestIncrementalSearchIsBehaviourNeutral(t *testing.T) {
 
 	for _, fen := range fens {
 		t.Run(fen, func(t *testing.T) {
-			nodesInc, moveInc := searchFixedDepth(t, fen, 6, nnueIncremental(net))
+			nodesInc, moveInc := searchFixedDepth(t, fen, 6, nnueIncremental(t, net))
 			nodesRef, moveRef := searchFixedDepth(t, fen, 6, nnueRefreshOnly(net))
 
 			if nodesInc != nodesRef || moveInc != moveRef {
@@ -156,7 +175,7 @@ func TestFixedDepthSearchIsDeterministicWithNNUE(t *testing.T) {
 			var first Result
 			for run := 0; run < 3; run++ {
 				p := mustParse(t, fen)
-				s := New(nnueIncremental(net), 16)
+				s := New(nnueIncremental(t, net), 16)
 				res := s.Search(context.Background(), p, Limits{Depth: 6}, nil)
 
 				if run == 0 {
