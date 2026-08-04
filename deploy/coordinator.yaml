@@ -34,7 +34,7 @@ spec:
             - name: NOVA_GENERATION
               value: "0"
             - name: NOVA_POSITIONS
-              value: "15000000"
+              value: "30000000"
             - name: NOVA_GAMES_PER_UNIT
               value: "50"
             - name: NOVA_NODES

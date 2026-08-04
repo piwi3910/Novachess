@@ -91,7 +91,7 @@ spec:
             - name: NOVA_WORKER_REPLICAS
               value: "8"
             - name: NOVA_POSITIONS
-              value: "15000000"
+              value: "30000000"
           ports:
             - containerPort: 8080
               name: http
