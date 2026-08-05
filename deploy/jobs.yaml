@@ -40,16 +40,16 @@ spec:
                 - "1024"
                 - -lr
                 - "0.001"
-                # Weight the game's outcome over the search's own score. At
-                # 0.5 half the training signal is the evaluation that played
-                # the games, so the network learns to imitate its teacher and
-                # approaches it from below rather than passing it - which is
-                # what generation zero's gates measured: -446, -196, -44 Elo
-                # against the hand-crafted evaluation, closing but never
-                # crossing. The outcome is noisier but it is the only signal
-                # that can exceed the player that generated it.
+                # Back to an even blend. The theory that a 0.5 blend caps
+                # the network at imitating its teacher was tested and lost:
+                # 30M positions at 0.8 gated at -68.8 Elo, worse than 15M
+                # positions at 0.5 had managed (-43.9), while more data on
+                # its own had improved every previous round. At this search
+                # depth the score signal is dense and the outcome signal is
+                # mostly noise, so leaning on the outcome cost more than the
+                # imitation ceiling it was meant to lift.
                 - -result-weight
-                - "0.8"
+                - "0.5"
                 - -lr-drops
                 - "8,12"
                 - -init

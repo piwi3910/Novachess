@@ -91,7 +91,7 @@ func newFakeCluster() *fakeCluster {
 				"-epochs", "15",
 				"-batch", "1024",
 				"-lr", "0.001",
-				"-result-weight", "0.8",
+				"-result-weight", "0.5",
 				"-lr-drops", "8,12",
 				"-init", "/data/networks/gen0.nnue",
 			},
@@ -492,7 +492,7 @@ func TestTrainerFlagsSurviveLaunchVerbatim(t *testing.T) {
 	}
 
 	cmd := fc.jobCommands[0]
-	wantVerbatim := [][2]string{{"-epochs", "15"}, {"-batch", "1024"}, {"-lr", "0.001"}, {"-result-weight", "0.8"}, {"-lr-drops", "8,12"}}
+	wantVerbatim := [][2]string{{"-epochs", "15"}, {"-batch", "1024"}, {"-lr", "0.001"}, {"-result-weight", "0.5"}, {"-lr-drops", "8,12"}}
 	for _, pair := range wantVerbatim {
 		found := false
 		for i, arg := range cmd {
