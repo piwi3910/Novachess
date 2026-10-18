@@ -9,7 +9,7 @@
 
 # The SPA builds first so the Go stage can embed it. package.json is copied
 # alone first for layer caching, same reasoning as go.mod below.
-FROM --platform=$BUILDPLATFORM node:22 AS web
+FROM --platform=$BUILDPLATFORM node:26 AS web
 WORKDIR /web
 COPY web/dashboard/package.json web/dashboard/package-lock.json ./
 RUN npm ci
