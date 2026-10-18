@@ -1,13 +1,20 @@
 name: CI
 
 on:
+  # unit tier — fast, hermetic gate on every pull request and branch push.
+  pull_request:
   push:
     branches: ["**"]
-  pull_request:
+    # full tier — a release tag runs every tier, including the deep suites.
+    tags: ["v*"]
+  # integration tier — nightly. Also runnable on demand.
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
 
 jobs:
   test:
-    name: Build and test
+    name: Build and test (unit)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -31,14 +38,20 @@ jobs:
       - name: Build
         run: go build ./...
 
-      # The race-instrumented search and perft-adjacent suites legitimately
-      # run for many minutes on CI runners; Go's default 10m-per-package
-      # timeout is what trips here, not a hang. Give it real headroom.
+      # The PR gate must stay fast, so the race-instrumented run and the
+      # full-depth perft suite are not here: they are the integration/full
+      # tiers below, driven by the nightly schedule and by release tags.
       - name: Test
-        run: go test -race -timeout 30m ./...
+        run: go test ./...
 
   perft:
     name: Full-depth perft
+    # Integration (nightly) and full (release) tiers only: the deep node counts
+    # are far too slow for the pull-request gate.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -48,11 +61,32 @@ jobs:
           go-version: "stable"
 
       # The deep node counts are the real correctness gate for move generation.
-      # They are too slow for every local `go test` run but cheap enough to run
-      # on every push here. This covers the classical positions, the Chess960
-      # suite across all 960 arrangements, and the mirror-symmetry check.
+      # This covers the classical positions, the Chess960 suite across all 960
+      # arrangements, and the mirror-symmetry check.
       - name: Perft
         run: go test ./internal/chess/ -run 'TestPerft|TestChess960' -perft-full -timeout 60m
+
+  race:
+    name: Race detector
+    # Same integration/full tier as perft: the race-instrumented search is the
+    # other slow suite, so it leaves the fast unit gate.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "stable"
+
+      # The race-instrumented search and perft-adjacent suites legitimately
+      # run for many minutes on CI runners; Go's default 10m-per-package
+      # timeout is what trips here, not a hang. Give it real headroom.
+      - name: Test with the race detector
+        run: go test -race -timeout 30m ./...
 
   cross-compile:
     name: Cross-compile for the cluster
@@ -74,7 +108,7 @@ jobs:
     name: Build and push image
     runs-on: ubuntu-latest
     # Push events only: forked pull requests cannot write packages, and the
-    # test job already proves the code builds.
+    # test job already proves the code builds. Tag pushes ride the full tier.
     if: github.event_name == 'push'
     permissions:
       contents: read
